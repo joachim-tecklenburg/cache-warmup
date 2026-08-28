@@ -1,0 +1,120 @@
+# cache-warmup
+
+Walk a sitemap and request every page, so the server or CDN cache is primed
+before real visitors arrive.
+
+The point of difference: **it checks that what it warmed is not broken.** A
+page that dies halfway through rendering still returns `HTTP 200`, and your
+cache will happily store it and serve it to everyone. A naive warmer reports
+that as a success.
+
+```
+cache-warmup https://example.com/sitemap.xml
+```
+
+```
+sitemap index: https://example.com/sitemap.xml
+sitemap: https://example.com/wp-sitemap-posts-page-1.xml (20 urls)
+warming 53 urls as a browser, one at a time
+[ 1/53] 200   0.14s    320K  https://example.com/
+[ 2/53] 200   0.19s    275K  https://example.com/about/
+...
+checking 87 stylesheet/script url(s) referenced by those pages
+
+53 urls, avg 0.15s, slowest 0.30s
+  2xx          53
+  median page 282K
+  87 stylesheet/script urls, 0 missing
+```
+
+## Install
+
+Requires `bash`, `curl` and `awk` — everything is present on a stock macOS or
+Linux box. Drop it anywhere on your `PATH`:
+
+```sh
+curl -o ~/.local/bin/cache-warmup \
+  https://raw.githubusercontent.com/joachim-tecklenburg/cache-warmup/main/cache-warmup
+chmod +x ~/.local/bin/cache-warmup
+```
+
+## Usage
+
+```
+cache-warmup [options] <sitemap-url|domain>
+```
+
+A bare domain is expanded to `https://<domain>/sitemap.xml`, so
+`cache-warmup example.com` is usually all you need. Sitemap indexes are
+followed recursively (up to 3 levels), plain sitemaps work too, `.xml.gz` is
+decompressed, and URLs are deduplicated before anything is requested.
+
+| Option | Meaning |
+| --- | --- |
+| `-P N` | request N pages in parallel (default: 1, strictly sequential) |
+| `-t SEC` | per-request timeout (default: 120) |
+| `-A STR` | User-Agent (default: a current desktop Chrome) |
+| `-a LANG` | Accept-Language |
+| `-H 'K: V'` | extra request header, repeatable |
+| `-F` | do not follow redirects |
+| `-r` | do not retry failed or suspect pages |
+| `-s` | skip the stylesheet/script check |
+| `-l` | list the URLs only, don't request them |
+| `-q` | quiet: only the summary |
+| `-h` | help |
+
+Exit status is `1` if any page or asset came back broken, so it drops into a
+deploy hook or cron job unchanged.
+
+## What it checks
+
+Three failures produce a broken layout while still returning `HTTP 200`, and
+each has a check:
+
+- **Truncated pages.** A page that ran out of memory or time mid-render is
+  stored by the cache as a complete 200. Every response body is checked for a
+  closing `</html>`.
+- **Short pages.** A page can close its tags and still have rendered only a
+  fraction of its content. Every page is measured against the median page size
+  of the run and flagged below 40%.
+- **Missing stylesheets and scripts.** A page whose CSS 404s renders as
+  unstyled HTML. Every same-origin `<link rel=stylesheet>` and `<script src>`
+  is collected from the page bodies, deduplicated across the whole run, and
+  fetched once to prove it exists. Quoted, unquoted and single-quoted
+  attributes are handled, as is `rel=preload as=style`; third-party hosts and
+  inline scripts are ignored.
+
+Anything flagged is retried once, sequentially. Whatever is still broken is
+listed at the end, because a bad page already in the cache will not be fixed
+by warming — the cache answers without ever asking the backend. Purge those
+URLs first, then warm again.
+
+## Why sequential by default
+
+Warming with many parallel requests is how you break the thing you are trying
+to speed up. Several workers rendering heavy pages at once on a cold backend
+can push one into a memory or time limit; it emits a partial page with status
+200, and the cache keeps it. Pages are fetched one at a time unless `-P` says
+otherwise.
+
+## Why it impersonates a browser
+
+Requests carry a real desktop Chrome `User-Agent` plus the `Accept`,
+`Accept-Language` and `Sec-Fetch-*` headers a browser sends, follow redirects,
+and accept compressed responses. This matters more than it looks:
+
+- Bare `curl` sends no `Accept-Encoding` at all. On a site sending
+  `Vary: Accept-Encoding`, that warms the uncompressed variant while every
+  real visitor still gets a cold miss.
+- A `curl/8.x` User-Agent triggers server-side branching that a browser never
+  sees — mobile/device cache buckets, bot detection in security and consent
+  plugins, WAF challenges. An interstitial or a stripped bot page returns 200
+  and gets cached for everyone.
+
+Two differences remain and cannot be fixed here: no JavaScript is executed, so
+client-rendered content is not warmed, and the TLS fingerprint is still
+curl's, which a determined bot protection can spot.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

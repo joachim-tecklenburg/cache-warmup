@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+# cache-warmup — walk a sitemap (or sitemap index) and request every page
+# so the server/CDN cache is primed.
+#
+#   cache-warmup https://example.com/sitemap.xml
+#   cache-warmup example.com                 # assumes /sitemap.xml
+#   cache-warmup -P 4 https://example.com/sitemap.xml   # faster, harder on the backend
+#
+# Requests are made as a real browser would make them, one page at a time by
+# default, and every response body is checked for truncation — a half-rendered
+# page that returns HTTP 200 will otherwise be stored by the cache and served
+# to real visitors with a broken layout.
+
+set -uo pipefail
+
+VERSION=2.2.0
+PAR=1
+FOLLOW=1
+TIMEOUT=120
+CONNECT_TIMEOUT=15
+LIST_ONLY=0
+QUIET=0
+CHECK_ASSETS=1
+RETRY=1
+MAX_DEPTH=3
+SHORT_RATIO=40      # flag pages under this % of the median page size
+UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+LANG_HEADER="de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+EXTRA_HEADERS=()
+
+usage() {
+  cat <<USAGE
+cache-warmup $VERSION — prime a site's cache from its sitemap
+
+Usage: cache-warmup [options] <sitemap-url|domain>
+       a bare domain is expanded to https://<domain>/sitemap.xml
+
+Options:
+  -P N        request N pages in parallel (default: $PAR, strictly sequential)
+  -t SEC      per-request timeout (default: $TIMEOUT)
+  -A STR      User-Agent (default: a current desktop Chrome)
+  -a LANG     Accept-Language (default: $LANG_HEADER)
+  -H 'K: V'   extra request header, repeatable
+  -F          do not follow redirects
+  -r          do not retry failed/suspect pages
+  -s          skip the stylesheet/script check
+  -l          list the URLs only, don't request them
+  -q          quiet: only the summary
+  -h          this help
+
+Pages are fetched one at a time so a cold backend is never asked to render
+several heavy pages at once. Raise -P only if the site can take it.
+
+Every page is checked for truncation and for being suspiciously short
+compared to the rest of the site. Every same-origin stylesheet and script
+it references is then fetched once to prove it is not a 404 -- a missing
+CSS file renders a perfectly valid HTTP 200 page with no layout at all.
+
+Exit status is 1 if any page or asset came back broken. Purge those URLs
+and warm them again.
+USAGE
+}
+
+while getopts ":P:t:A:a:H:Frslqh" opt; do
+  case "$opt" in
+    P) PAR=$OPTARG ;;
+    t) TIMEOUT=$OPTARG ;;
+    A) UA=$OPTARG ;;
+    a) LANG_HEADER=$OPTARG ;;
+    H) EXTRA_HEADERS+=("$OPTARG") ;;
+    F) FOLLOW=0 ;;
+    r) RETRY=0 ;;
+    s) CHECK_ASSETS=0 ;;
+    l) LIST_ONLY=1 ;;
+    q) QUIET=1 ;;
+    h) usage; exit 0 ;;
+    \?) echo "cache-warmup: unknown option -$OPTARG" >&2; usage >&2; exit 2 ;;
+    :)  echo "cache-warmup: -$OPTARG needs a value" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+[ $# -eq 1 ] || { usage >&2; exit 2; }
+
+TARGET=$1
+case "$TARGET" in http://*|https://*) ;; *) TARGET="https://$TARGET" ;; esac
+case "${TARGET#*://}" in */*) ;; *) TARGET="$TARGET/sitemap.xml" ;; esac
+
+if [ -t 2 ]; then
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_B=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_OK=; C_WARN=; C_ERR=; C_DIM=; C_B=; C_OFF=
+fi
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/cache-warmup.XXXXXX") || exit 1
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+# ---------------------------------------------------------------- sitemap walk
+
+sitemap_fetch() {
+  local body
+  body=$(curl -sSL --compressed -A "$UA" --max-time "$TIMEOUT" "$1" 2>"$TMP/curl.err")
+  case "$1" in *.gz) printf '%s' "$body" | gzip -dc 2>/dev/null ;; *) printf '%s' "$body" ;; esac
+}
+
+locs() {
+  tr '\n' ' ' | grep -o '<loc>[^<]*</loc>' | sed 's/<loc>[[:space:]]*\(.*\)[[:space:]]*<\/loc>/\1/'
+}
+
+collect() {  # collect <url> <depth>
+  local url=$1 depth=$2 body found
+  [ "$depth" -gt "$MAX_DEPTH" ] && return
+  body=$(sitemap_fetch "$url")
+  if [ -z "$body" ]; then
+    echo "cache-warmup: no content from $url" >&2
+    [ -s "$TMP/curl.err" ] && sed 's/^/  /' "$TMP/curl.err" >&2
+    return
+  fi
+  found=$(printf '%s' "$body" | locs)
+  if [ -z "$found" ]; then
+    echo "cache-warmup: no <loc> entries in $url" >&2
+    return
+  fi
+  if printf '%s' "$body" | grep -q '<sitemapindex'; then
+    [ "$QUIET" -eq 1 ] || echo "${C_DIM}sitemap index: $url${C_OFF}" >&2
+    while IFS= read -r sub; do
+      [ -n "$sub" ] && collect "$sub" $((depth + 1))
+    done <<< "$found"
+  else
+    [ "$QUIET" -eq 1 ] || \
+      echo "${C_DIM}sitemap: $url ($(printf '%s\n' "$found" | wc -l | tr -d ' ') urls)${C_OFF}" >&2
+    printf '%s\n' "$found" >> "$TMP/urls"
+  fi
+}
+
+: > "$TMP/urls"
+collect "$TARGET" 1
+sort -u "$TMP/urls" > "$TMP/urls.uniq"
+TOTAL=$(wc -l < "$TMP/urls.uniq" | tr -d ' ')
+
+[ "$TOTAL" -eq 0 ] && { echo "cache-warmup: found no URLs to warm" >&2; exit 1; }
+[ "$LIST_ONLY" -eq 1 ] && { cat "$TMP/urls.uniq"; exit 0; }
+
+# ------------------------------------------------------------------ the worker
+# Fetches one page as a browser would, keeps the body long enough to verify it,
+# and prints: code <TAB> seconds <TAB> bytes <TAB> flag <TAB> url
+
+cat > "$TMP/worker.sh" <<'WORKER'
+#!/usr/bin/env bash
+url=$1
+body="$TMP/body.$$"
+hdr="$TMP/hdr.$$"
+
+follow=""; [ "$FOLLOW" -eq 1 ] && follow="-L"
+
+# One header per line; kept as array elements so values may contain spaces.
+hdrargs=()
+if [ -s "$TMP/headers" ]; then
+  while IFS= read -r h; do
+    [ -n "$h" ] && hdrargs+=(-H "$h")
+  done < "$TMP/headers"
+fi
+
+IFS=$'\t' read -r code time ctype eff < <(
+  curl -s $follow --compressed \
+    -A "$UA" \
+    -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
+    -H "Accept-Language: $LANG_HEADER" \
+    -H "Upgrade-Insecure-Requests: 1" \
+    -H "Sec-Fetch-Dest: document" -H "Sec-Fetch-Mode: navigate" \
+    -H "Sec-Fetch-Site: none" -H "Sec-Fetch-User: ?1" \
+    ${hdrargs[@]+"${hdrargs[@]}"} \
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" \
+    -D "$hdr" -o "$body" \
+    -w '%{http_code}\t%{time_total}\t%{content_type}\t%{url_effective}\n' \
+    "$url"
+)
+code=${code:-000}; time=${time:-0}; eff=${eff:-$url}
+bytes=$(wc -c < "$body" 2>/dev/null | tr -d ' '); bytes=${bytes:-0}
+
+flag=ok
+case "$code" in
+  2*|3*) ;;
+  *) flag=httperror ;;
+esac
+if [ "$flag" = ok ]; then
+  case "$ctype" in
+    *html*)
+      if [ "$bytes" -lt 512 ]; then
+        flag=tiny
+      elif ! tail -c 512 "$body" | grep -qi '</html>'; then
+        # rendering died partway through; the cache will store this as a 200
+        flag=truncated
+      fi
+      ;;
+    *) flag=nonhtml ;;
+  esac
+fi
+
+# Harvest the stylesheets and scripts this page depends on. Quotes are
+# normalised to " first so one regex covers both attribute styles.
+if [ "$CHECK_ASSETS" -eq 1 ] && [ "$flag" = ok ]; then
+  origin=$(printf '%s' "$eff" | sed -E 's#^(https?://[^/]+).*#\1#')
+  dir=$(printf '%s' "$eff" | sed -E 's#[^/]*$##')
+  tr '\n' ' ' < "$body" | tr "'" '"' | awk '{
+      s = $0
+      while (match(s, /<(link|script)[^>]*>/)) {
+        tag = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+        if (tag ~ /^<script/) attr = "src"
+        else if (tag ~ /rel="[^"]*stylesheet/ || tag ~ /rel=stylesheet/) attr = "href"
+        else if ((tag ~ /rel="[^"]*preload/ || tag ~ /rel=preload/) && tag ~ /as="?style/) attr = "href"
+        else continue
+        v = ""
+        if (match(tag, attr "=\"[^\"]*\""))                       # href="..."
+          v = substr(tag, RSTART + length(attr) + 2, RLENGTH - length(attr) - 3)
+        else if (match(tag, attr "=[^\" >]+"))                     # href=... (minified)
+          v = substr(tag, RSTART + length(attr) + 1, RLENGTH - length(attr) - 1)
+        if (v != "") print v
+      }
+    }' \
+  | while IFS= read -r a; do
+      case "$a" in
+        http://*|https://*) ;;
+        //*)   a="https:$a" ;;
+        /*)    a="$origin$a" ;;
+        data:*|"#"*|javascript:*) continue ;;
+        *)     a="$dir$a" ;;
+      esac
+      printf '%s\t%s\n' "$a" "$eff"
+    done >> "$TMP/assets.$$"
+fi
+
+printf '%s\t%s\t%s\t%s\t%s\n' "$code" "$time" "$bytes" "$flag" "$eff"
+rm -f "$body" "$hdr"
+WORKER
+chmod +x "$TMP/worker.sh"
+
+: > "$TMP/headers"
+for h in ${EXTRA_HEADERS[@]+"${EXTRA_HEADERS[@]}"}; do
+  printf '%s\n' "$h" >> "$TMP/headers"
+done
+export TMP UA LANG_HEADER FOLLOW TIMEOUT CONNECT_TIMEOUT CHECK_ASSETS
+
+# ------------------------------------------------------------------- warm them
+
+render() {  # reads result lines on stdin, prints progress, appends to results
+  local n=0 code time bytes flag url c mark
+  while IFS=$'\t' read -r code time bytes flag url; do
+    printf '%s\t%s\t%s\t%s\t%s\n' "$code" "$time" "$bytes" "$flag" "$url" >> "$TMP/results"
+    [ "$QUIET" -eq 1 ] && continue
+    n=$((n + 1))
+    case "$flag" in
+      ok|nonhtml) c=$C_OK; mark="" ;;
+      truncated)  c=$C_ERR; mark="  ${C_ERR}<- TRUNCATED, page did not finish rendering${C_OFF}" ;;
+      tiny)       c=$C_ERR; mark="  ${C_ERR}<- suspiciously small${C_OFF}" ;;
+      *)          c=$C_ERR; mark="" ;;
+    esac
+    [ "$code" = 000 ] && code="---"
+    printf '%s[%*d/%d]%s %s%s%s %6.2fs %6sK  %s%s\n' \
+      "$C_DIM" "${#TOTAL}" "$((n + DONE))" "$TOTAL" "$C_OFF" \
+      "$c" "$code" "$C_OFF" "$time" "$((bytes / 1024))" "$url" "$mark" >&2
+  done
+}
+
+: > "$TMP/results"
+DONE=0
+if [ "$QUIET" -eq 0 ]; then
+  if [ "$PAR" -le 1 ]; then
+    echo "warming $TOTAL urls as a browser, one at a time" >&2
+  else
+    echo "warming $TOTAL urls as a browser, $PAR at a time" >&2
+  fi
+fi
+
+# The first page goes alone: on a cold site it is the one that triggers all the
+# one-off work (object caches, generated CSS), and letting N workers race to do
+# that at once is what produces half-built pages.
+head -1 "$TMP/urls.uniq" | "$TMP/worker.sh" "$(head -1 "$TMP/urls.uniq")" | render
+DONE=1
+
+if [ "$TOTAL" -gt 1 ]; then
+  tail -n +2 "$TMP/urls.uniq" | xargs -n1 -P"$PAR" "$TMP/worker.sh" | render
+fi
+
+# ------------------------------------------------------------------- retry pass
+
+median_of() {  # median byte size of the intact html pages in $1
+  awk -F'\t' '$4 == "ok" { print $3 }' "$1" | sort -n | \
+    awk '{ a[NR] = $1 } END { if (NR) print (NR % 2) ? a[(NR + 1) / 2] : int((a[NR / 2] + a[NR / 2 + 1]) / 2) }'
+}
+
+if [ "$RETRY" -eq 1 ]; then
+  # Short pages only become visible once there is a median to compare against,
+  # so work that out first and retry them alongside the outright failures.
+  MED_PRE=$(median_of "$TMP/results"); MED_PRE=${MED_PRE:-0}
+  awk -F'\t' -v med="$MED_PRE" -v ratio="$SHORT_RATIO" '
+    $4 != "ok" && $4 != "nonhtml" { print $5; next }
+    $4 == "ok" && med > 0 && $3 * 100 / med < ratio { print $5 }' "$TMP/results" | sort -u > "$TMP/redo"
+  if [ -s "$TMP/redo" ]; then
+    [ "$QUIET" -eq 1 ] || \
+      printf '\n%sretrying %s url(s) one at a time%s\n' \
+        "$C_WARN" "$(wc -l < "$TMP/redo" | tr -d ' ')" "$C_OFF" >&2
+    while IFS= read -r u; do
+      "$TMP/worker.sh" "$u" >> "$TMP/results.retry"
+      [ "$QUIET" -eq 1 ] || tail -1 "$TMP/results.retry" | \
+        awk -F'\t' -v ok="$C_OK" -v er="$C_ERR" -v off="$C_OFF" \
+          '{ c = ($4 == "ok" || $4 == "nonhtml") ? ok : er
+             printf "  retry %s%s %s%s  %s\n", c, $1, $4, off, $5 }' >&2
+    done < "$TMP/redo"
+    # retry result wins: drop the original line for any retried url
+    if [ -s "$TMP/results.retry" ]; then
+      grep -vFf <(cut -f5 "$TMP/results.retry") "$TMP/results" > "$TMP/results.keep" 2>/dev/null
+      cat "$TMP/results.keep" "$TMP/results.retry" > "$TMP/results.final" 2>/dev/null
+      mv "$TMP/results.final" "$TMP/results"
+    fi
+  fi
+fi
+
+# ----------------------------------------------------------------- asset check
+# A page can return a flawless 200 and still render unstyled, because the CSS
+# it points at is a 404. Fetch every same-origin stylesheet and script once,
+# however many pages reference it.
+
+ASSET_BAD=0
+if [ "$CHECK_ASSETS" -eq 1 ]; then
+  cat "$TMP"/assets.* 2>/dev/null | sort -u > "$TMP/assets.all"
+  SITE_HOST=$(printf '%s' "$TARGET" | sed -E 's#^https?://([^/]+).*#\1#')
+  awk -F'\t' -v host="$SITE_HOST" '
+    { u = $1; sub(/^https?:\/\//, "", u); sub(/\/.*$/, "", u)
+      if (u == host) n[$1]++ }
+    END { for (a in n) printf "%d\t%s\n", n[a], a }' "$TMP/assets.all" \
+    | sort -t"$(printf '\t')" -k2 > "$TMP/assets.uniq"
+  NASSET=$(wc -l < "$TMP/assets.uniq" | tr -d ' ')
+
+  if [ "$NASSET" -gt 0 ]; then
+    [ "$QUIET" -eq 1 ] || \
+      printf '\n%schecking %s stylesheet/script url(s) referenced by those pages%s\n' \
+        "$C_DIM" "$NASSET" "$C_OFF" >&2
+    : > "$TMP/assets.results"
+    afollow=""; [ "$FOLLOW" -eq 1 ] && afollow="-L"
+    while IFS="$(printf '\t')" read -r refs a; do
+      acode=$(curl -s $afollow --compressed -A "$UA" \
+                --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" \
+                -o /dev/null -w '%{http_code}' "$a" 2>/dev/null)
+      acode=${acode:-000}
+      printf '%s\t%s\t%s\n' "$acode" "$refs" "$a" >> "$TMP/assets.results"
+      case "$acode" in
+        2*) ;;
+        *) [ "$QUIET" -eq 1 ] || printf '  %s%s%s  %s  %s(referenced by %s page(s))%s\n' \
+             "$C_ERR" "$acode" "$C_OFF" "$a" "$C_DIM" "$refs" "$C_OFF" >&2 ;;
+      esac
+    done < "$TMP/assets.uniq"
+    ASSET_BAD=$(awk -F'\t' '$1 !~ /^2/' "$TMP/assets.results" | wc -l | tr -d ' ')
+  fi
+fi
+
+# --------------------------------------------------------------------- summary
+# A page that is far shorter than its peers rendered only partially even if it
+# closed its </html>, so measure every page against the median.
+
+MEDIAN=$(median_of "$TMP/results"); MEDIAN=${MEDIAN:-0}
+
+awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WARN" \
+    -v er="$C_ERR" -v dim="$C_DIM" -v b="$C_B" -v off="$C_OFF" \
+    -v nassets="${NASSET:-0}" -v abad="$ASSET_BAD" '
+  { n++; sum += $2
+    if ($2 > slow) { slow = $2; slowurl = $5 }
+    cls = ($1 == "000") ? "no response" : substr($1, 1, 1) "xx"
+    count[cls]++
+    if ($4 != "ok" && $4 != "nonhtml") { bad[++nbad] = $4 "\t" $5 }
+    else if ($4 == "ok" && med > 0 && $3 * 100 / med < ratio) {
+      bad[++nbad] = sprintf("short (%d%% of median)\t%s", $3 * 100 / med, $5) }
+  }
+  END {
+    printf "\n%s%d urls, avg %.2fs, slowest %.2fs%s\n", dim, n, (n ? sum / n : 0), slow, off
+    for (c in count) {
+      col = (c == "2xx") ? ok : ((c ~ /^3/) ? warn : er)
+      printf "  %s%-12s %d%s\n", col, c, count[c], off
+    }
+    if (med > 0) printf "%s  median page %.0fK%s\n", dim, med / 1024, off
+    if (nassets > 0) {
+      col = (abad > 0) ? er : dim
+      printf "%s  %d stylesheet/script urls, %d missing%s\n", col, nassets, abad, off
+    }
+    if (abad > 0) {
+      printf "\n%s%d stylesheet/script url(s) are missing -- pages using them render unstyled.%s\n", er b, abad, off
+    }
+    if (nbad) {
+      printf "\n%s%d page(s) came back broken:%s\n", er b, nbad, off
+      for (i = 1; i <= nbad; i++) { split(bad[i], p, "\t"); printf "  %s%-28s%s %s\n", er, p[1], off, p[2] }
+      printf "\n%sA broken page that returned HTTP 200 may now be sitting in the cache.%s\n", warn, off
+      printf "%sPurge these URLs, then warm them again.%s\n", warn, off
+    }
+  }' "$TMP/results" >&2
+
+[ "$ASSET_BAD" -gt 0 ] && exit 1
+awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" '
+  $4 != "ok" && $4 != "nonhtml" { bad = 1 }
+  $4 == "ok" && med > 0 && $3 * 100 / med < ratio { bad = 1 }
+  END { exit !bad }' "$TMP/results" && exit 1
+exit 0
