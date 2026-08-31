@@ -52,7 +52,7 @@ decompressed, and URLs are deduplicated before anything is requested.
 | Option | Meaning |
 | --- | --- |
 | `-P N` | request N pages in parallel (default: 1, strictly sequential) |
-| `-d SEC` | pause SEC between pages, fractions allowed (default: 0) |
+| `-d SEC` | pause between pages; `auto` scales it with render time, `0` disables (default: `auto`) |
 | `-t SEC` | per-request timeout (default: 120) |
 | `-A STR` | User-Agent (default: a current desktop Chrome) |
 | `-a LANG` | Accept-Language |
@@ -106,8 +106,28 @@ listed at the end, because a bad page already in the cache will not be fixed
 by warming — the cache answers without ever asking the backend. Purge those
 URLs first, then warm again.
 
-If a site produces these dropouts under warming, `-d` puts a pause between
-pages and gives the backend a moment to settle before the next render.
+## Why it paces itself
+
+PHP does not stop working when the response is sent. Transients, options and
+the cache file itself are written after the last byte goes out. Requesting the
+next page the instant the previous one completes starts a fresh render on top
+of that shutdown work — and a generated `<style>` block whose transient is
+mid-write can come back empty, which is how a page ends up cached with its
+fonts or its custom CSS missing.
+
+Note that this is not a concurrency problem: at the default `-P 1` there is
+only ever one request in flight. A browser actually hits the server *harder*
+per page, because it fetches every stylesheet and script in parallel right
+after the HTML. What a browser has is a gap between one page and the next.
+`-d` is that gap.
+
+A flat number is the wrong instrument, so the default is `auto`: the pause is
+30% of how long the page took, capped at 1.5s, and skipped entirely below 0.5s
+because a response that fast came from the cache and rendered nothing. On a
+site that is already warm this costs about 2 seconds across 125 pages. On a
+cold site it scales the pause to the pages that actually need it.
+
+Use `-d 0` to turn it off, or `-d 2` for a fixed pause if a backend needs more.
 
 ## Why sequential by default
 

@@ -13,9 +13,13 @@
 
 set -uo pipefail
 
-VERSION=2.4.0
+VERSION=2.5.0
 PAR=1
-DELAY=0            # seconds to pause after each page, to let the backend settle
+DELAY=auto         # pause after each page so the backend can finish shutdown work;
+                   # 'auto' scales it with how long the page took, 0 disables
+DELAY_FACTOR=0.3   # auto: pause this fraction of the render time
+DELAY_FLOOR=0.5    # auto: below this the page came from cache, so don't pause
+DELAY_CAP=1.5      # auto: never pause longer than this
 FOLLOW=1
 TIMEOUT=120
 CONNECT_TIMEOUT=15
@@ -40,7 +44,8 @@ Usage: cache-warmup [options] <sitemap-url|domain>
 
 Options:
   -P N        request N pages in parallel (default: $PAR, strictly sequential)
-  -d SEC      pause SEC between pages (default: $DELAY; fractions allowed)
+  -d SEC      pause SEC between pages; 'auto' scales the pause with how
+              long each page took, 0 disables (default: $DELAY)
   -t SEC      per-request timeout (default: $TIMEOUT)
   -A STR      User-Agent (default: a current desktop Chrome)
   -a LANG     Accept-Language (default: $LANG_HEADER)
@@ -276,10 +281,21 @@ fi
 printf '%s\t%s\t%s\t%s\t%s\n' "$code" "$time" "$bytes" "$flag" "$eff"
 rm -f "$body" "$hdr"
 
-# A backend that is still finishing the previous render can emit a page with a
-# generated block missing -- valid html, http 200, and the cache keeps it.
-# -d buys it a moment to settle between pages.
-case "$DELAY" in 0|0.0|"") ;; *) sleep "$DELAY" ;; esac
+# PHP does not stop working when the response is sent: transients, options and
+# the cache file itself are written after the last byte goes out. Starting the
+# next render on top of that is how a page ends up cached with a generated
+# block missing -- valid html, http 200, and the cache keeps it for good.
+#
+# 'auto' pauses in proportion to how long this page took, so a genuine render
+# gets settle time while a page served straight from cache gets none.
+case "$DELAY" in
+  0|0.0|"") ;;
+  auto)
+    nap=$(awk -v t="$time" -v f="$DELAY_FACTOR" -v lo="$DELAY_FLOOR" -v hi="$DELAY_CAP" \
+      'BEGIN { if (t <= lo) { print 0; exit } n = t * f; if (n > hi) n = hi; printf "%.2f", n }')
+    case "$nap" in 0|0.00) ;; *) sleep "$nap" ;; esac ;;
+  *) sleep "$DELAY" ;;
+esac
 WORKER
 chmod +x "$TMP/worker.sh"
 
@@ -287,7 +303,8 @@ chmod +x "$TMP/worker.sh"
 for h in ${EXTRA_HEADERS[@]+"${EXTRA_HEADERS[@]}"}; do
   printf '%s\n' "$h" >> "$TMP/headers"
 done
-export TMP UA LANG_HEADER FOLLOW TIMEOUT CONNECT_TIMEOUT CHECK_ASSETS DELAY
+export TMP UA LANG_HEADER FOLLOW TIMEOUT CONNECT_TIMEOUT CHECK_ASSETS \
+       DELAY DELAY_FACTOR DELAY_FLOOR DELAY_CAP
 
 # ------------------------------------------------------------------- warm them
 
