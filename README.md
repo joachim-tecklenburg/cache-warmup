@@ -52,6 +52,7 @@ decompressed, and URLs are deduplicated before anything is requested.
 | Option | Meaning |
 | --- | --- |
 | `-P N` | request N pages in parallel (default: 1, strictly sequential) |
+| `-d SEC` | pause SEC between pages, fractions allowed (default: 0) |
 | `-t SEC` | per-request timeout (default: 120) |
 | `-A STR` | User-Agent (default: a current desktop Chrome) |
 | `-a LANG` | Accept-Language |
@@ -59,6 +60,7 @@ decompressed, and URLs are deduplicated before anything is requested.
 | `-F` | do not follow redirects |
 | `-r` | do not retry failed or suspect pages |
 | `-s` | skip the stylesheet/script check |
+| `-C` | skip the cross-page consistency check |
 | `-l` | list the URLs only, don't request them |
 | `-q` | quiet: only the summary |
 | `-h` | help |
@@ -68,7 +70,7 @@ deploy hook or cron job unchanged.
 
 ## What it checks
 
-Three failures produce a broken layout while still returning `HTTP 200`, and
+Four failures produce a broken layout while still returning `HTTP 200`, and
 each has a check:
 
 - **Truncated pages.** A page that ran out of memory or time mid-render is
@@ -83,11 +85,29 @@ each has a check:
   fetched once to prove it exists. Quoted, unquoted and single-quoted
   attributes are handled, as is `rel=preload as=style`; third-party hosts and
   inline scripts are ignored.
+- **Pages missing CSS their neighbours have.** The nastiest one, because the
+  page is complete, the right size, and every asset it points at resolves —
+  it is simply missing one thing. A page built while the backend was still
+  warming up can silently omit a generated `<style>` block, and the cache
+  stores that copy for good. Every page is fingerprinted with the stylesheets
+  it links and the ids of its non-empty inline `<style>` blocks; anything that
+  90% of the run carries is expected on all of it, and pages missing something
+  are named along with what they are missing. An inline block that is present
+  but empty counts as missing, because that is how it looks to a visitor.
+
+This last check found a live example on the first site it ran against: two
+pages out of 125 were cached without Elementor Pro's `@font-face` block, so
+they rendered in a fallback font while the other 123 were correct. Requesting
+the same URLs with a cache-busting query string returned the block — the
+backend was fine, only the cached copies were poisoned.
 
 Anything flagged is retried once, sequentially. Whatever is still broken is
 listed at the end, because a bad page already in the cache will not be fixed
 by warming — the cache answers without ever asking the backend. Purge those
 URLs first, then warm again.
+
+If a site produces these dropouts under warming, `-d` puts a pause between
+pages and gives the backend a moment to settle before the next render.
 
 ## Why sequential by default
 

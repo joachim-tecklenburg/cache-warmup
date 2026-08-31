@@ -13,8 +13,9 @@
 
 set -uo pipefail
 
-VERSION=2.2.0
+VERSION=2.4.0
 PAR=1
+DELAY=0            # seconds to pause after each page, to let the backend settle
 FOLLOW=1
 TIMEOUT=120
 CONNECT_TIMEOUT=15
@@ -24,6 +25,8 @@ CHECK_ASSETS=1
 RETRY=1
 MAX_DEPTH=3
 SHORT_RATIO=40      # flag pages under this % of the median page size
+CONSIST=1
+CONSIST_PCT=90      # a css resource on this % of pages is expected on all of them
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 LANG_HEADER="de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
 EXTRA_HEADERS=()
@@ -37,6 +40,7 @@ Usage: cache-warmup [options] <sitemap-url|domain>
 
 Options:
   -P N        request N pages in parallel (default: $PAR, strictly sequential)
+  -d SEC      pause SEC between pages (default: $DELAY; fractions allowed)
   -t SEC      per-request timeout (default: $TIMEOUT)
   -A STR      User-Agent (default: a current desktop Chrome)
   -a LANG     Accept-Language (default: $LANG_HEADER)
@@ -44,6 +48,7 @@ Options:
   -F          do not follow redirects
   -r          do not retry failed/suspect pages
   -s          skip the stylesheet/script check
+  -C          skip the cross-page consistency check
   -l          list the URLs only, don't request them
   -q          quiet: only the summary
   -h          this help
@@ -56,14 +61,20 @@ compared to the rest of the site. Every same-origin stylesheet and script
 it references is then fetched once to prove it is not a 404 -- a missing
 CSS file renders a perfectly valid HTTP 200 page with no layout at all.
 
+Finally the pages are compared against each other: any page missing a
+stylesheet or an inline <style> block that $CONSIST_PCT% of the other pages carry
+is reported. That is the shape of a cached page that was built while the
+backend was still warming up -- valid, complete, correct size, no layout.
+
 Exit status is 1 if any page or asset came back broken. Purge those URLs
 and warm them again.
 USAGE
 }
 
-while getopts ":P:t:A:a:H:Frslqh" opt; do
+while getopts ":P:d:t:A:a:H:FrsClqh" opt; do
   case "$opt" in
     P) PAR=$OPTARG ;;
+    d) DELAY=$OPTARG ;;
     t) TIMEOUT=$OPTARG ;;
     A) UA=$OPTARG ;;
     a) LANG_HEADER=$OPTARG ;;
@@ -71,6 +82,7 @@ while getopts ":P:t:A:a:H:Frslqh" opt; do
     F) FOLLOW=0 ;;
     r) RETRY=0 ;;
     s) CHECK_ASSETS=0 ;;
+    C) CONSIST=0 ;;
     l) LIST_ONLY=1 ;;
     q) QUIET=1 ;;
     h) usage; exit 0 ;;
@@ -197,12 +209,16 @@ if [ "$flag" = ok ]; then
   esac
 fi
 
-# Harvest the stylesheets and scripts this page depends on. Quotes are
-# normalised to " first so one regex covers both attribute styles.
-if [ "$CHECK_ASSETS" -eq 1 ] && [ "$flag" = ok ]; then
+# Harvest what this page depends on: the stylesheets and scripts it links to,
+# and the ids of its non-empty inline <style> blocks. Quotes are normalised
+# to " first so one regex covers both attribute styles.
+if [ "$flag" = ok ]; then
   origin=$(printf '%s' "$eff" | sed -E 's#^(https?://[^/]+).*#\1#')
   dir=$(printf '%s' "$eff" | sed -E 's#[^/]*$##')
-  tr '\n' ' ' < "$body" | tr "'" '"' | awk '{
+  flat="$TMP/flat.$$"
+  tr '\n' ' ' < "$body" | tr "'" '"' > "$flat"
+
+  awk '{
       s = $0
       while (match(s, /<(link|script)[^>]*>/)) {
         tag = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
@@ -217,7 +233,7 @@ if [ "$CHECK_ASSETS" -eq 1 ] && [ "$flag" = ok ]; then
           v = substr(tag, RSTART + length(attr) + 1, RLENGTH - length(attr) - 1)
         if (v != "") print v
       }
-    }' \
+    }' "$flat" \
   | while IFS= read -r a; do
       case "$a" in
         http://*|https://*) ;;
@@ -226,12 +242,44 @@ if [ "$CHECK_ASSETS" -eq 1 ] && [ "$flag" = ok ]; then
         data:*|"#"*|javascript:*) continue ;;
         *)     a="$dir$a" ;;
       esac
-      printf '%s\t%s\n' "$a" "$eff"
-    done >> "$TMP/assets.$$"
+      printf '%s\n' "$a"
+    done | sort -u > "$TMP/refs.$$"
+
+  if [ "$CHECK_ASSETS" -eq 1 ]; then
+    awk -v p="$eff" '{ print $0 "\t" p }' "$TMP/refs.$$" >> "$TMP/assets.$$"
+  fi
+
+  # Fingerprint for the cross-page consistency check. Same-origin urls are
+  # recorded host-relative; an inline <style> that is present but empty counts
+  # as absent, because that is exactly how it looks to a visitor.
+  { awk -v o="$origin" '{ u = $0
+        if (index(u, o "/") == 1) u = substr(u, length(o) + 1)
+        print u }' "$TMP/refs.$$"
+    awk '{
+        s = $0
+        while (match(s, /<style[^>]*>/)) {
+          tag = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+          id = ""
+          if (match(tag, /id="[^"]*"/)) id = substr(tag, RSTART + 4, RLENGTH - 5)
+          end = index(s, "</style>")
+          content = end ? substr(s, 1, end - 1) : s
+          if (end) s = substr(s, end + 8)
+          gsub(/[ \t]/, "", content)
+          if (id != "" && length(content) >= 8) print "<style id=\"" id "\">"
+        }
+      }' "$flat"
+  } | sort -u | awk -v p="$eff" '{ print p "\t" $0 }' >> "$TMP/fp.$$"
+
+  rm -f "$flat" "$TMP/refs.$$"
 fi
 
 printf '%s\t%s\t%s\t%s\t%s\n' "$code" "$time" "$bytes" "$flag" "$eff"
 rm -f "$body" "$hdr"
+
+# A backend that is still finishing the previous render can emit a page with a
+# generated block missing -- valid html, http 200, and the cache keeps it.
+# -d buys it a moment to settle between pages.
+case "$DELAY" in 0|0.0|"") ;; *) sleep "$DELAY" ;; esac
 WORKER
 chmod +x "$TMP/worker.sh"
 
@@ -239,7 +287,7 @@ chmod +x "$TMP/worker.sh"
 for h in ${EXTRA_HEADERS[@]+"${EXTRA_HEADERS[@]}"}; do
   printf '%s\n' "$h" >> "$TMP/headers"
 done
-export TMP UA LANG_HEADER FOLLOW TIMEOUT CONNECT_TIMEOUT CHECK_ASSETS
+export TMP UA LANG_HEADER FOLLOW TIMEOUT CONNECT_TIMEOUT CHECK_ASSETS DELAY
 
 # ------------------------------------------------------------------- warm them
 
@@ -354,6 +402,43 @@ if [ "$CHECK_ASSETS" -eq 1 ]; then
   fi
 fi
 
+# ----------------------------------------------------------- consistency check
+# The failure the checks above cannot see: a page that returns 200, closes its
+# </html>, is a normal size and whose every asset resolves -- but which is
+# missing one stylesheet, or one inline <style> block, that the rest of the
+# site has. From outside, that is what a cache holding a half-built copy of a
+# page looks like, and it is why a single page can render unstyled while its
+# neighbours are fine.
+
+CONSIST_BAD=0
+if [ "$CONSIST" -eq 1 ] && [ "$TOTAL" -ge 8 ]; then
+  cat "$TMP"/fp.* > "$TMP/fp.all" 2>/dev/null
+  if [ -s "$TMP/fp.all" ]; then
+    NFP=$(cut -f1 "$TMP/fp.all" | sort -u | wc -l | tr -d ' ')
+    awk -F'\t' -v total="$NFP" -v pct="$CONSIST_PCT" '
+      { has[$1 SUBSEP $2] = 1; cnt[$2]++; page[$1] = 1 }
+      END {
+        need = total * pct / 100
+        for (r in cnt) if (cnt[r] >= need) common[r] = 1
+        for (p in page) {
+          miss = ""; n = 0
+          for (r in common) if (!((p SUBSEP r) in has)) miss = miss (n++ ? "\t" : "") r
+          if (n) print p "\t" miss
+        }
+      }' "$TMP/fp.all" | sort > "$TMP/consist"
+    CONSIST_BAD=$(wc -l < "$TMP/consist" | tr -d ' ')
+    if [ "$CONSIST_BAD" -gt 0 ] && [ "$QUIET" -eq 0 ]; then
+      printf '\n%s%d page(s) are missing css that %d%% of the site has:%s\n' \
+        "$C_ERR$C_B" "$CONSIST_BAD" "$CONSIST_PCT" "$C_OFF" >&2
+      while IFS= read -r line; do
+        printf '  %s%s%s\n' "$C_ERR" "$(printf '%s' "$line" | cut -f1)" "$C_OFF" >&2
+        printf '%s' "$line" | cut -f2- | tr '\t' '\n' | \
+          while IFS= read -r r; do printf '      %smissing %s%s\n' "$C_DIM" "$r" "$C_OFF" >&2; done
+      done < "$TMP/consist"
+    fi
+  fi
+fi
+
 # --------------------------------------------------------------------- summary
 # A page that is far shorter than its peers rendered only partially even if it
 # closed its </html>, so measure every page against the median.
@@ -362,7 +447,7 @@ MEDIAN=$(median_of "$TMP/results"); MEDIAN=${MEDIAN:-0}
 
 awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WARN" \
     -v er="$C_ERR" -v dim="$C_DIM" -v b="$C_B" -v off="$C_OFF" \
-    -v nassets="${NASSET:-0}" -v abad="$ASSET_BAD" '
+    -v nassets="${NASSET:-0}" -v abad="$ASSET_BAD" -v cbad="$CONSIST_BAD" '
   { n++; sum += $2
     if ($2 > slow) { slow = $2; slowurl = $5 }
     cls = ($1 == "000") ? "no response" : substr($1, 1, 1) "xx"
@@ -382,8 +467,15 @@ awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WA
       col = (abad > 0) ? er : dim
       printf "%s  %d stylesheet/script urls, %d missing%s\n", col, nassets, abad, off
     }
+    if (cbad > 0) {
+      col = er
+      printf "%s  %d page(s) missing css the rest of the site has%s\n", col, cbad, off
+    }
     if (abad > 0) {
       printf "\n%s%d stylesheet/script url(s) are missing -- pages using them render unstyled.%s\n", er b, abad, off
+    }
+    if (cbad > 0) {
+      printf "\n%sThose pages are cached without css their neighbours have. Purge them and warm again.%s\n", warn, off
     }
     if (nbad) {
       printf "\n%s%d page(s) came back broken:%s\n", er b, nbad, off
@@ -394,6 +486,7 @@ awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WA
   }' "$TMP/results" >&2
 
 [ "$ASSET_BAD" -gt 0 ] && exit 1
+[ "$CONSIST_BAD" -gt 0 ] && exit 1
 awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" '
   $4 != "ok" && $4 != "nonhtml" { bad = 1 }
   $4 == "ok" && med > 0 && $3 * 100 / med < ratio { bad = 1 }
