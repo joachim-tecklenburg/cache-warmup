@@ -85,21 +85,22 @@ each has a check:
   fetched once to prove it exists. Quoted, unquoted and single-quoted
   attributes are handled, as is `rel=preload as=style`; third-party hosts and
   inline scripts are ignored.
-- **Pages missing CSS their neighbours have.** The nastiest one, because the
-  page is complete, the right size, and every asset it points at resolves —
-  it is simply missing one thing. A page built while the backend was still
-  warming up can silently omit a generated `<style>` block, and the cache
-  stores that copy for good. Every page is fingerprinted with the stylesheets
-  it links and the ids of its non-empty inline `<style>` blocks; anything that
-  90% of the run carries is expected on all of it, and pages missing something
-  are named along with what they are missing. An inline block that is present
-  but empty counts as missing, because that is how it looks to a visitor.
+- **Pages that do not load CSS their neighbours load.** The nastiest one,
+  because the page is complete, the right size, and every asset it points at
+  resolves — it is simply not pulling something in. A page built while the
+  backend was still warming up can silently omit a generated `<style>` block,
+  and the cache stores that copy for good. Every page is fingerprinted with
+  the stylesheets it links and every `url()` its inline CSS references — fonts
+  above all. Anything 90% of the run pulls in is expected everywhere, and
+  pages missing something are named along with the exact file.
 
-This last check found a live example on the first site it ran against: two
-pages out of 125 were cached without Elementor Pro's `@font-face` block, so
-they rendered in a fallback font while the other 123 were correct. Requesting
-the same URLs with a cache-busting query string returned the block — the
-backend was fine, only the cached copies were poisoned.
+  The fingerprint deliberately keys on **what the CSS delivers, not which
+  `<style>` block delivers it**. An earlier version compared `<style id=…>`
+  labels and produced a false positive on the first real site it ran against:
+  Elementor emitted the same `@font-face` rules under one id on some pages and
+  two on others, and the tool called a perfectly good page broken. Pages whose
+  markup is shaped differently but which load the same files are now reported
+  as a note and do not fail the run.
 
 Anything flagged is retried once, sequentially. Whatever is still broken is
 listed at the end, because a bad page already in the cache will not be fixed

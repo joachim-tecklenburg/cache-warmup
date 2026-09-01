@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION=2.5.0
+VERSION=2.6.0
 PAR=1
 DELAY=auto         # pause after each page so the backend can finish shutdown work;
                    # 'auto' scales it with how long the page took, 0 disables
@@ -259,8 +259,8 @@ if [ "$flag" = ok ]; then
   # as absent, because that is exactly how it looks to a visitor.
   { awk -v o="$origin" '{ u = $0
         if (index(u, o "/") == 1) u = substr(u, length(o) + 1)
-        print u }' "$TMP/refs.$$"
-    awk '{
+        print "url " u }' "$TMP/refs.$$"
+    awk -v o="$origin" '{
         s = $0
         while (match(s, /<style[^>]*>/)) {
           tag = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
@@ -269,8 +269,21 @@ if [ "$flag" = ok ]; then
           end = index(s, "</style>")
           content = end ? substr(s, 1, end - 1) : s
           if (end) s = substr(s, end + 8)
-          gsub(/[ \t]/, "", content)
-          if (id != "" && length(content) >= 8) print "<style id=\"" id "\">"
+
+          # What this block actually pulls in. A page can emit the same rules
+          # under a different id -- fonts land in one <style> on some pages and
+          # another on others -- so the url is the thing worth comparing.
+          c = content
+          while (match(c, /url\(['"'"'"]?[^)'"'"'"]+['"'"'"]?\)/)) {
+            u = substr(c, RSTART, RLENGTH); c = substr(c, RSTART + RLENGTH)
+            sub(/^url\(['"'"'"]?/, "", u); sub(/['"'"'"]?\)$/, "", u)
+            if (u ~ /^data:/ || u == "") continue
+            if (index(u, o "/") == 1) u = substr(u, length(o) + 1)
+            print "url " u
+          }
+
+          squished = content; gsub(/[ \t]/, "", squished)
+          if (id != "" && length(squished) >= 8) print "id <style id=\"" id "\">"
         }
       }' "$flat"
   } | sort -u | awk -v p="$eff" '{ print p "\t" $0 }' >> "$TMP/fp.$$"
@@ -428,30 +441,52 @@ fi
 # neighbours are fine.
 
 CONSIST_BAD=0
+CONSIST_SOFT=0
 if [ "$CONSIST" -eq 1 ] && [ "$TOTAL" -ge 8 ]; then
   cat "$TMP"/fp.* > "$TMP/fp.all" 2>/dev/null
   if [ -s "$TMP/fp.all" ]; then
     NFP=$(cut -f1 "$TMP/fp.all" | sort -u | wc -l | tr -d ' ')
+    # "url" misses are real: the page does not load something its peers load.
+    # "id" misses only say the markup is shaped differently -- the same rules
+    # can be emitted under another <style> id, which is not a defect.
     awk -F'\t' -v total="$NFP" -v pct="$CONSIST_PCT" '
       { has[$1 SUBSEP $2] = 1; cnt[$2]++; page[$1] = 1 }
       END {
         need = total * pct / 100
         for (r in cnt) if (cnt[r] >= need) common[r] = 1
         for (p in page) {
-          miss = ""; n = 0
-          for (r in common) if (!((p SUBSEP r) in has)) miss = miss (n++ ? "\t" : "") r
-          if (n) print p "\t" miss
+          hard = ""; soft = ""
+          for (r in common) {
+            if ((p SUBSEP r) in has) continue
+            kind = substr(r, 1, index(r, " ") - 1)
+            what = substr(r, index(r, " ") + 1)
+            if (kind == "url") hard = hard (hard ? "\t" : "") what
+            else               soft = soft (soft ? "\t" : "") what
+          }
+          if (hard != "") print "H\t" p "\t" hard
+          else if (soft != "") print "S\t" p "\t" soft
         }
       }' "$TMP/fp.all" | sort > "$TMP/consist"
-    CONSIST_BAD=$(wc -l < "$TMP/consist" | tr -d ' ')
-    if [ "$CONSIST_BAD" -gt 0 ] && [ "$QUIET" -eq 0 ]; then
-      printf '\n%s%d page(s) are missing css that %d%% of the site has:%s\n' \
+
+    CONSIST_BAD=$(awk -F'\t' '$1 == "H"' "$TMP/consist" | wc -l | tr -d ' ')
+    CONSIST_SOFT=$(awk -F'\t' '$1 == "S"' "$TMP/consist" | wc -l | tr -d ' ')
+
+    if [ "$QUIET" -eq 0 ] && [ "$CONSIST_BAD" -gt 0 ]; then
+      printf '\n%s%d page(s) do not load css that %d%% of the site loads:%s\n' \
         "$C_ERR$C_B" "$CONSIST_BAD" "$CONSIST_PCT" "$C_OFF" >&2
-      while IFS= read -r line; do
-        printf '  %s%s%s\n' "$C_ERR" "$(printf '%s' "$line" | cut -f1)" "$C_OFF" >&2
-        printf '%s' "$line" | cut -f2- | tr '\t' '\n' | \
-          while IFS= read -r r; do printf '      %smissing %s%s\n' "$C_DIM" "$r" "$C_OFF" >&2; done
-      done < "$TMP/consist"
+      awk -F'\t' -v er="$C_ERR" -v dim="$C_DIM" -v off="$C_OFF" '
+        $1 == "H" { printf "  %s%s%s\n", er, $2, off
+                    for (i = 3; i <= NF; i++) printf "      %smissing %s%s\n", dim, $i, off }' \
+        "$TMP/consist" >&2
+    fi
+    if [ "$QUIET" -eq 0 ] && [ "$CONSIST_SOFT" -gt 0 ]; then
+      printf '\n%s%d page(s) emit the same css under a different <style> id -- not a fault,%s\n' \
+        "$C_DIM" "$CONSIST_SOFT" "$C_OFF" >&2
+      printf '%sbut worth a look if one of them renders wrong:%s\n' "$C_DIM" "$C_OFF" >&2
+      awk -F'\t' -v dim="$C_DIM" -v off="$C_OFF" '
+        $1 == "S" { printf "  %s%s%s\n", dim, $2, off
+                    for (i = 3; i <= NF; i++) printf "      %sno %s%s\n", dim, $i, off }' \
+        "$TMP/consist" >&2
     fi
   fi
 fi
@@ -485,14 +520,13 @@ awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WA
       printf "%s  %d stylesheet/script urls, %d missing%s\n", col, nassets, abad, off
     }
     if (cbad > 0) {
-      col = er
-      printf "%s  %d page(s) missing css the rest of the site has%s\n", col, cbad, off
+      printf "%s  %d page(s) not loading css the rest of the site loads%s\n", er, cbad, off
     }
     if (abad > 0) {
       printf "\n%s%d stylesheet/script url(s) are missing -- pages using them render unstyled.%s\n", er b, abad, off
     }
     if (cbad > 0) {
-      printf "\n%sThose pages are cached without css their neighbours have. Purge them and warm again.%s\n", warn, off
+      printf "\n%sThose pages are cached without css their neighbours load. Purge them and warm again.%s\n", warn, off
     }
     if (nbad) {
       printf "\n%s%d page(s) came back broken:%s\n", er b, nbad, off
