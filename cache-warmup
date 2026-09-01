@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION=2.6.0
+VERSION=2.7.0
 PAR=1
 DELAY=auto         # pause after each page so the backend can finish shutdown work;
                    # 'auto' scales it with how long the page took, 0 disables
@@ -400,6 +400,7 @@ fi
 # however many pages reference it.
 
 ASSET_BAD=0
+ASSET_FLAKY=0
 if [ "$CHECK_ASSETS" -eq 1 ]; then
   cat "$TMP"/assets.* 2>/dev/null | sort -u > "$TMP/assets.all"
   SITE_HOST=$(printf '%s' "$TARGET" | sed -E 's#^https?://([^/]+).*#\1#')
@@ -416,16 +417,33 @@ if [ "$CHECK_ASSETS" -eq 1 ]; then
         "$C_DIM" "$NASSET" "$C_OFF" >&2
     : > "$TMP/assets.results"
     afollow=""; [ "$FOLLOW" -eq 1 ] && afollow="-L"
+    fetch_asset() {
+      curl -s $afollow --compressed -A "$UA" \
+        --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" \
+        -o /dev/null -w '%{http_code}' "$1" 2>/dev/null
+    }
     while IFS="$(printf '\t')" read -r refs a; do
-      acode=$(curl -s $afollow --compressed -A "$UA" \
-                --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" \
-                -o /dev/null -w '%{http_code}' "$a" 2>/dev/null)
-      acode=${acode:-000}
+      acode=$(fetch_asset "$a"); acode=${acode:-000}
+      tries=1
+      # A server will occasionally 404 a file that is plainly there -- measured
+      # at about 1 in 60 on a live site, on a stylesheet every page loads. One
+      # bad answer is not evidence a file is missing, so ask again before
+      # reporting it and failing the run over it.
+      while [ "$RETRY" -eq 1 ] && [ "$tries" -lt 3 ]; do
+        case "$acode" in 2*) break ;; esac
+        sleep 1
+        acode=$(fetch_asset "$a"); acode=${acode:-000}
+        tries=$((tries + 1))
+      done
       printf '%s\t%s\t%s\n' "$acode" "$refs" "$a" >> "$TMP/assets.results"
       case "$acode" in
-        2*) ;;
-        *) [ "$QUIET" -eq 1 ] || printf '  %s%s%s  %s  %s(referenced by %s page(s))%s\n' \
-             "$C_ERR" "$acode" "$C_OFF" "$a" "$C_DIM" "$refs" "$C_OFF" >&2 ;;
+        2*) if [ "$tries" -gt 1 ]; then
+              ASSET_FLAKY=$((ASSET_FLAKY + 1))
+              [ "$QUIET" -eq 1 ] || printf '  %sflaky%s %s  %s(failed %s time(s), then 200)%s\n' \
+                "$C_WARN" "$C_OFF" "$a" "$C_DIM" "$((tries - 1))" "$C_OFF" >&2
+            fi ;;
+        *) [ "$QUIET" -eq 1 ] || printf '  %s%s%s  %s  %s(referenced by %s page(s), %s tries)%s\n' \
+             "$C_ERR" "$acode" "$C_OFF" "$a" "$C_DIM" "$refs" "$tries" "$C_OFF" >&2 ;;
       esac
     done < "$TMP/assets.uniq"
     ASSET_BAD=$(awk -F'\t' '$1 !~ /^2/' "$TMP/assets.results" | wc -l | tr -d ' ')
@@ -499,7 +517,8 @@ MEDIAN=$(median_of "$TMP/results"); MEDIAN=${MEDIAN:-0}
 
 awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WARN" \
     -v er="$C_ERR" -v dim="$C_DIM" -v b="$C_B" -v off="$C_OFF" \
-    -v nassets="${NASSET:-0}" -v abad="$ASSET_BAD" -v cbad="$CONSIST_BAD" '
+    -v nassets="${NASSET:-0}" -v abad="$ASSET_BAD" -v cbad="$CONSIST_BAD" \
+    -v aflaky="$ASSET_FLAKY" '
   { n++; sum += $2
     if ($2 > slow) { slow = $2; slowurl = $5 }
     cls = ($1 == "000") ? "no response" : substr($1, 1, 1) "xx"
@@ -522,8 +541,15 @@ awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WA
     if (cbad > 0) {
       printf "%s  %d page(s) not loading css the rest of the site loads%s\n", er, cbad, off
     }
+    if (aflaky > 0) {
+      printf "%s  %d asset(s) 404ed once, then loaded on retry%s\n", warn, aflaky, off
+    }
     if (abad > 0) {
       printf "\n%s%d stylesheet/script url(s) are missing -- pages using them render unstyled.%s\n", er b, abad, off
+    }
+    if (aflaky > 0) {
+      printf "\n%sThe server answered 404 for %d file(s) that are actually there, then served%s\n", warn, aflaky, off
+      printf "%sthem on retry. Not fatal here, but real visitors hit the same odds.%s\n", warn, off
     }
     if (cbad > 0) {
       printf "\n%sThose pages are cached without css their neighbours load. Purge them and warm again.%s\n", warn, off

@@ -84,7 +84,11 @@ each has a check:
   is collected from the page bodies, deduplicated across the whole run, and
   fetched once to prove it exists. Quoted, unquoted and single-quoted
   attributes are handled, as is `rel=preload as=style`; third-party hosts and
-  inline scripts are ignored.
+  inline scripts are ignored. A file that fails is asked for again before it
+  is believed — a live server was measured returning 404 for a stylesheet that
+  was plainly there about once in every sixty requests, and one bad answer is
+  not evidence a file is missing. Files that fail and then load are reported
+  separately and do not fail the run, because real visitors hit the same odds.
 - **Pages that do not load CSS their neighbours load.** The nastiest one,
   because the page is complete, the right size, and every asset it points at
   resolves — it is simply not pulling something in. A page built while the
