@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION=2.7.0
+VERSION=2.8.0
 PAR=1
 DELAY=auto         # pause after each page so the backend can finish shutdown work;
                    # 'auto' scales it with how long the page took, 0 disables
@@ -31,6 +31,7 @@ MAX_DEPTH=3
 SHORT_RATIO=40      # flag pages under this % of the median page size
 CONSIST=1
 CONSIST_PCT=90      # a css resource on this % of pages is expected on all of them
+USE_ROBOTS=1        # ask robots.txt which sitemaps the site has
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 LANG_HEADER="de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
 EXTRA_HEADERS=()
@@ -54,9 +55,16 @@ Options:
   -r          do not retry failed/suspect pages
   -s          skip the stylesheet/script check
   -C          skip the cross-page consistency check
+  -N          do not read robots.txt; warm only the sitemap given
   -l          list the URLs only, don't request them
   -q          quiet: only the summary
   -h          this help
+
+robots.txt is read first and every sitemap it announces is walked as well.
+Multilingual sites routinely publish one sitemap per language and list them
+all there, while /sitemap.xml carries only the default language -- warming
+just that one leaves every other language cold. Use -N to warm strictly the
+sitemap you named.
 
 Pages are fetched one at a time so a cold backend is never asked to render
 several heavy pages at once. Raise -P only if the site can take it.
@@ -76,7 +84,7 @@ and warm them again.
 USAGE
 }
 
-while getopts ":P:d:t:A:a:H:FrsClqh" opt; do
+while getopts ":P:d:t:A:a:H:FrsCNlqh" opt; do
   case "$opt" in
     P) PAR=$OPTARG ;;
     d) DELAY=$OPTARG ;;
@@ -88,6 +96,7 @@ while getopts ":P:d:t:A:a:H:FrsClqh" opt; do
     r) RETRY=0 ;;
     s) CHECK_ASSETS=0 ;;
     C) CONSIST=0 ;;
+    N) USE_ROBOTS=0 ;;
     l) LIST_ONLY=1 ;;
     q) QUIET=1 ;;
     h) usage; exit 0 ;;
@@ -100,8 +109,12 @@ shift $((OPTIND - 1))
 [ $# -eq 1 ] || { usage >&2; exit 2; }
 
 TARGET=$1
+GUESSED=0   # 1 when /sitemap.xml is our assumption rather than the user's
 case "$TARGET" in http://*|https://*) ;; *) TARGET="https://$TARGET" ;; esac
-case "${TARGET#*://}" in */*) ;; *) TARGET="$TARGET/sitemap.xml" ;; esac
+case "${TARGET#*://}" in */*) ;; *) TARGET="$TARGET/sitemap.xml"; GUESSED=1 ;; esac
+
+ORIGIN=$(printf '%s' "$TARGET" | sed -E 's#^(https?://[^/]+).*#\1#')
+ORIGIN_HOST=${ORIGIN#*://}
 
 if [ -t 2 ]; then
   C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_B=$'\033[1m'; C_OFF=$'\033[0m'
@@ -113,6 +126,26 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/cache-warmup.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
 # ---------------------------------------------------------------- sitemap walk
+
+# robots.txt announces sitemaps with lines like "Sitemap: https://...".
+# The keyword is case-insensitive, the whitespace around it is arbitrary, and
+# plenty of sites write a site-relative path even though the spec wants an
+# absolute URL -- so parse leniently.
+robots_sitemaps() {  # robots_sitemaps <origin>
+  curl -sL --compressed -A "$UA" \
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" \
+    "$1/robots.txt" 2>/dev/null \
+  | tr -d '\r' \
+  | awk '{
+      line = $0
+      sub(/#.*/, "", line)
+      if (match(tolower(line), /^[ \t]*sitemap[ \t]*:/)) {
+        v = substr(line, RLENGTH + 1)
+        gsub(/^[ \t]+/, "", v); gsub(/[ \t]+$/, "", v)
+        if (v != "") print v
+      }
+    }'
+}
 
 sitemap_fetch() {
   local body
@@ -127,6 +160,10 @@ locs() {
 collect() {  # collect <url> <depth>
   local url=$1 depth=$2 body found
   [ "$depth" -gt "$MAX_DEPTH" ] && return
+  # robots.txt and a sitemap index routinely name the same file; an index can
+  # also point back at its own parent. Walk each sitemap once.
+  grep -qxF "$url" "$TMP/walked" 2>/dev/null && return
+  printf '%s\n' "$url" >> "$TMP/walked"
   body=$(sitemap_fetch "$url")
   if [ -z "$body" ]; then
     echo "cache-warmup: no content from $url" >&2
@@ -151,7 +188,43 @@ collect() {  # collect <url> <depth>
 }
 
 : > "$TMP/urls"
-collect "$TARGET" 1
+: > "$TMP/walked"
+
+# What robots.txt says the site has. Entries on another host are reported but
+# not walked -- a robots.txt is not permission to go and hammer a third party.
+SITEMAPS=()
+if [ "$USE_ROBOTS" -eq 1 ]; then
+  while IFS= read -r sm; do
+    [ -n "$sm" ] || continue
+    case "$sm" in
+      http://*|https://*) ;;
+      /*) sm="$ORIGIN$sm" ;;
+      *)  sm="$ORIGIN/$sm" ;;
+    esac
+    smhost=${sm#*://}; smhost=${smhost%%/*}
+    if [ "$smhost" != "$ORIGIN_HOST" ]; then
+      [ "$QUIET" -eq 1 ] || \
+        echo "${C_DIM}robots.txt: skipping $sm (different host)${C_OFF}" >&2
+      continue
+    fi
+    SITEMAPS+=("$sm")
+  done < <(robots_sitemaps "$ORIGIN" | sort -u)
+fi
+
+if [ "${#SITEMAPS[@]}" -gt 0 ]; then
+  [ "$QUIET" -eq 1 ] || \
+    echo "${C_DIM}robots.txt lists ${#SITEMAPS[@]} sitemap(s)${C_OFF}" >&2
+fi
+
+# The sitemap the user named is walked too -- unless /sitemap.xml was only our
+# own guess and robots.txt has already told us where the real ones are.
+if [ "$GUESSED" -eq 0 ] || [ "${#SITEMAPS[@]}" -eq 0 ]; then
+  SITEMAPS=("$TARGET" ${SITEMAPS[@]+"${SITEMAPS[@]}"})
+fi
+
+for sm in ${SITEMAPS[@]+"${SITEMAPS[@]}"}; do
+  collect "$sm" 1
+done
 sort -u "$TMP/urls" > "$TMP/urls.uniq"
 TOTAL=$(wc -l < "$TMP/urls.uniq" | tr -d ' ')
 

@@ -49,6 +49,26 @@ A bare domain is expanded to `https://<domain>/sitemap.xml`, so
 followed recursively (up to 3 levels), plain sitemaps work too, `.xml.gz` is
 decompressed, and URLs are deduplicated before anything is requested.
 
+`robots.txt` is read first and every sitemap it announces is walked as well:
+
+```
+robots.txt lists 3 sitemap(s)
+sitemap: https://example.com/sitemap-de.xml (48 urls)
+sitemap: https://example.com/sitemap-en.xml (48 urls)
+sitemap: https://example.com/sitemap-fr.xml (31 urls)
+```
+
+This matters on multilingual sites. WPML, Polylang and most of the
+multi-site setups publish one sitemap per language and list them all in
+`robots.txt`, while `/sitemap.xml` carries only the default language.
+Warming that one file leaves every other language cold — and a cold
+language is exactly where a visitor is most likely to be the unlucky one
+who triggers a bad cache write. `Sitemap:` is matched case-insensitively,
+site-relative paths are accepted, and each sitemap is walked once no matter
+how many times it is named. Entries pointing at a **different host** are
+reported and skipped; someone else's `robots.txt` is not a reason to go and
+hammer their server. Use `-N` to warm strictly the sitemap you named.
+
 | Option | Meaning |
 | --- | --- |
 | `-P N` | request N pages in parallel (default: 1, strictly sequential) |
@@ -61,6 +81,7 @@ decompressed, and URLs are deduplicated before anything is requested.
 | `-r` | do not retry failed or suspect pages |
 | `-s` | skip the stylesheet/script check |
 | `-C` | skip the cross-page consistency check |
+| `-N` | do not read `robots.txt`; warm only the sitemap given |
 | `-l` | list the URLs only, don't request them |
 | `-q` | quiet: only the summary |
 | `-h` | help |
