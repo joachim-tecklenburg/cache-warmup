@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION=2.8.0
+VERSION=2.9.0
 PAR=1
 DELAY=auto         # pause after each page so the backend can finish shutdown work;
                    # 'auto' scales it with how long the page took, 0 disables
@@ -111,7 +111,13 @@ shift $((OPTIND - 1))
 TARGET=$1
 GUESSED=0   # 1 when /sitemap.xml is our assumption rather than the user's
 case "$TARGET" in http://*|https://*) ;; *) TARGET="https://$TARGET" ;; esac
-case "${TARGET#*://}" in */*) ;; *) TARGET="$TARGET/sitemap.xml"; GUESSED=1 ;; esac
+# "example.com", "example.com/" and "https://example.com/" all mean the site,
+# not a document -- a pasted URL keeps its trailing slash and must not be
+# mistaken for a sitemap that happens to live at the web root.
+case "${TARGET#*://}" in
+  */?*) ;;
+  *) TARGET="${TARGET%/}/sitemap.xml"; GUESSED=1 ;;
+esac
 
 ORIGIN=$(printf '%s' "$TARGET" | sed -E 's#^(https?://[^/]+).*#\1#')
 ORIGIN_HOST=${ORIGIN#*://}
@@ -147,10 +153,22 @@ robots_sitemaps() {  # robots_sitemaps <origin>
     }'
 }
 
+# Leaves the document in $TMP/sm.out and sets SM_CODE / SM_EFF to the status
+# and the URL curl actually ended on, so a caller that did not get a sitemap
+# can say where it was sent instead. The body goes through a file rather than
+# stdout because $(...) would run this in a subshell and lose both variables.
+SM_EFF=""; SM_CODE=""
 sitemap_fetch() {
-  local body
-  body=$(curl -sSL --compressed -A "$UA" --max-time "$TIMEOUT" "$1" 2>"$TMP/curl.err")
-  case "$1" in *.gz) printf '%s' "$body" | gzip -dc 2>/dev/null ;; *) printf '%s' "$body" ;; esac
+  local raw
+  : > "$TMP/sm.body"   # a connection that fails outright leaves -o no file
+  raw=$(curl -sSL --compressed -A "$UA" --max-time "$TIMEOUT" \
+    -o "$TMP/sm.body" -w '%{http_code} %{url_effective}' "$1" 2>"$TMP/curl.err")
+  SM_CODE=${raw%% *}
+  SM_EFF=${raw#* }
+  case "$1" in
+    *.gz) gzip -dc < "$TMP/sm.body" > "$TMP/sm.out" 2>/dev/null ;;
+    *)    mv -f "$TMP/sm.body" "$TMP/sm.out" ;;
+  esac
 }
 
 locs() {
@@ -164,7 +182,8 @@ collect() {  # collect <url> <depth>
   # also point back at its own parent. Walk each sitemap once.
   grep -qxF "$url" "$TMP/walked" 2>/dev/null && return
   printf '%s\n' "$url" >> "$TMP/walked"
-  body=$(sitemap_fetch "$url")
+  sitemap_fetch "$url"
+  body=$(cat "$TMP/sm.out" 2>/dev/null)
   if [ -z "$body" ]; then
     echo "cache-warmup: no content from $url" >&2
     [ -s "$TMP/curl.err" ] && sed 's/^/  /' "$TMP/curl.err" >&2
@@ -172,7 +191,21 @@ collect() {  # collect <url> <depth>
   fi
   found=$(printf '%s' "$body" | locs)
   if [ -z "$found" ]; then
-    echo "cache-warmup: no <loc> entries in $url" >&2
+    # "no <loc> entries" on its own sends people hunting for a sitemap bug when
+    # the real answer is usually that they never received a sitemap: the site
+    # redirected the request somewhere else, or answered with a page.
+    echo "cache-warmup: $url is not a sitemap (HTTP $SM_CODE)" >&2
+    [ "$SM_EFF" != "$url" ] && echo "  the site sent us to $SM_EFF instead" >&2
+    case "$body" in
+      *"<html"*|*"<HTML"*|*"<!DOCTYPE html"*|*"<!doctype html"*)
+        echo "  what came back is an HTML page, not XML" >&2 ;;
+    esac
+    case "$body" in
+      *"type=\"password\""*|*"type='password'"*|*"name=\"pwd\""*|*"user_login"*)
+        echo "  it contains a password form -- the site is behind a login wall," >&2
+        echo "  so nothing here can be reached without the cookie your browser has." >&2
+        echo "  Copy it out of the browser and pass it with -H 'Cookie: ...'." >&2 ;;
+    esac
     return
   fi
   if printf '%s' "$body" | grep -q '<sitemapindex'; then

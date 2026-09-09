@@ -69,6 +69,23 @@ how many times it is named. Entries pointing at a **different host** are
 reported and skipped; someone else's `robots.txt` is not a reason to go and
 hammer their server. Use `-N` to warm strictly the sitemap you named.
 
+When what comes back is not a sitemap, the tool says so and says why,
+because "no URLs found" on its own sends people hunting for a sitemap bug
+that isn't there:
+
+```
+cache-warmup: https://example.com/sitemap.xml is not a sitemap (HTTP 200)
+  the site sent us to https://example.com/?protected-page=view instead
+  what came back is an HTML page, not XML
+  it contains a password form -- the site is behind a login wall,
+  so nothing here can be reached without the cookie your browser has.
+  Copy it out of the browser and pass it with -H 'Cookie: ...'.
+```
+
+A staging site behind a password plugin is the common case, and it is
+invisible from a browser that already holds the cookie — the sitemap opens
+perfectly for you while every anonymous request is bounced to a login form.
+
 | Option | Meaning |
 | --- | --- |
 | `-P N` | request N pages in parallel (default: 1, strictly sequential) |
