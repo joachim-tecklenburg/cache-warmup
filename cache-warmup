@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION=2.9.0
+VERSION=2.10.0
 PAR=1
 DELAY=auto         # pause after each page so the backend can finish shutdown work;
                    # 'auto' scales it with how long the page took, 0 disables
@@ -394,6 +394,33 @@ if [ "$flag" = ok ]; then
       }' "$flat"
   } | sort -u | awk -v p="$eff" '{ print p "\t" $0 }' >> "$TMP/fp.$$"
 
+  # Elementor stamps the post id on <body> as elementor-page-N and then has to
+  # supply rules for .elementor-N -- inline, or as an external post-N.css. If
+  # the page asks for its own stylesheet and no rule for it arrives, the page
+  # is missing exactly the CSS that positions it: global kit styles still load,
+  # so it renders as a mangled layout rather than as naked HTML, and it is the
+  # right size and returns 200. Nothing else here would notice.
+  #
+  # This needs no comparison with other pages. The page states which id it
+  # needs, so a miss is the page contradicting itself.
+  # A page can declare several ids -- a theme-builder template contributes its
+  # own on top of the post's -- and an id having no rules of its own is normal
+  # for a template that only arranges other people's widgets. What is not
+  # normal is *none* of them being styled, so require one hit, not all.
+  pids=$(grep -o 'elementor-page-[0-9]*' "$flat" | sed 's/[^0-9]//g' | sort -u)
+  if [ -n "$pids" ]; then
+    hit=0
+    for pid in $pids; do
+      if grep -q "\.elementor-$pid[ ,{.:]" "$flat" || grep -q "post-$pid\.css" "$flat"; then
+        hit=1; break
+      fi
+    done
+    if [ "$hit" -eq 0 ]; then
+      printf '%s\t%s\n' "$eff" "$(printf '%s' "$pids" | tr '\n' ',' | sed 's/,$//')" \
+        >> "$TMP/pagecss.$$"
+    fi
+  fi
+
   rm -f "$flat" "$TMP/refs.$$"
 fi
 
@@ -564,6 +591,38 @@ fi
 # page looks like, and it is why a single page can render unstyled while its
 # neighbours are fine.
 
+# Pages that asked for their own Elementor stylesheet and did not get it.
+PAGECSS_BAD=0
+cat "$TMP"/pagecss.* > "$TMP/pagecss.all" 2>/dev/null
+if [ -s "$TMP/pagecss.all" ]; then
+  PAGECSS_BAD=$(wc -l < "$TMP/pagecss.all" | tr -d ' ')
+  # If most of the site trips this, the site is not broken -- it keeps its
+  # Elementor css somewhere this check cannot see, and what is being measured
+  # is that arrangement rather than a defect. Say so instead of crying wolf.
+  if [ "$TOTAL" -ge 8 ] && [ $((PAGECSS_BAD * 2)) -gt "$TOTAL" ]; then
+    [ "$QUIET" -eq 1 ] || {
+      printf '\n%s%s of %s pages carry no rules for the elementor-page id they declare.%s\n' \
+        "$C_DIM" "$PAGECSS_BAD" "$TOTAL" "$C_OFF"
+      printf '%sThat is how this site is built, not a fault -- check skipped.%s\n' \
+        "$C_DIM" "$C_OFF"
+    } >&2
+    PAGECSS_BAD=0
+    : > "$TMP/pagecss.all"
+  fi
+fi
+if [ -s "$TMP/pagecss.all" ]; then
+  {
+    printf '\n%s%s page(s) are missing their own Elementor css:%s\n' \
+      "$C_ERR$C_B" "$PAGECSS_BAD" "$C_OFF"
+    while IFS="$(printf '\t')" read -r u pid; do
+      printf '  %s%s%s\n    %sdeclares elementor-page-%s but carries no rules for .elementor-%s%s\n' \
+        "$C_ERR" "$u" "$C_OFF" "$C_DIM" "$pid" "$pid" "$C_OFF"
+    done < "$TMP/pagecss.all"
+    printf '\n%sThe global kit css still loads, so these render as a mangled layout%s\n' "$C_WARN" "$C_OFF"
+    printf '%srather than as unstyled html. Purge them and warm them again.%s\n' "$C_WARN" "$C_OFF"
+  } >&2
+fi
+
 CONSIST_BAD=0
 CONSIST_SOFT=0
 if [ "$CONSIST" -eq 1 ] && [ "$TOTAL" -ge 8 ]; then
@@ -624,7 +683,7 @@ MEDIAN=$(median_of "$TMP/results"); MEDIAN=${MEDIAN:-0}
 awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WARN" \
     -v er="$C_ERR" -v dim="$C_DIM" -v b="$C_B" -v off="$C_OFF" \
     -v nassets="${NASSET:-0}" -v abad="$ASSET_BAD" -v cbad="$CONSIST_BAD" \
-    -v aflaky="$ASSET_FLAKY" '
+    -v aflaky="$ASSET_FLAKY" -v pcbad="$PAGECSS_BAD" '
   { n++; sum += $2
     if ($2 > slow) { slow = $2; slowurl = $5 }
     cls = ($1 == "000") ? "no response" : substr($1, 1, 1) "xx"
@@ -643,6 +702,9 @@ awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WA
     if (nassets > 0) {
       col = (abad > 0) ? er : dim
       printf "%s  %d stylesheet/script urls, %d missing%s\n", col, nassets, abad, off
+    }
+    if (pcbad > 0) {
+      printf "%s  %d page(s) missing their own Elementor css%s\n", er, pcbad, off
     }
     if (cbad > 0) {
       printf "%s  %d page(s) not loading css the rest of the site loads%s\n", er, cbad, off
@@ -669,6 +731,7 @@ awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WA
   }' "$TMP/results" >&2
 
 [ "$ASSET_BAD" -gt 0 ] && exit 1
+[ "$PAGECSS_BAD" -gt 0 ] && exit 1
 [ "$CONSIST_BAD" -gt 0 ] && exit 1
 awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" '
   $4 != "ok" && $4 != "nonhtml" { bad = 1 }

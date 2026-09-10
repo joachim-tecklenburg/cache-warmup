@@ -108,7 +108,7 @@ deploy hook or cron job unchanged.
 
 ## What it checks
 
-Four failures produce a broken layout while still returning `HTTP 200`, and
+Five failures produce a broken layout while still returning `HTTP 200`, and
 each has a check:
 
 - **Truncated pages.** A page that ran out of memory or time mid-render is
@@ -143,6 +143,27 @@ each has a check:
   two on others, and the tool called a perfectly good page broken. Pages whose
   markup is shaped differently but which load the same files are now reported
   as a note and do not fail the run.
+
+- **Pages missing their own Elementor CSS.** Elementor stamps the post id on
+  `<body>` as `elementor-page-1447` and then has to supply the rules for
+  `.elementor-1447`, inline or as a `post-1447.css`. When a page is rendered
+  while Elementor's generated CSS is being rebuilt, the global kit styles
+  still arrive but the page's own rules do not — and the cache keeps that
+  copy. The result is the hardest kind of failure to catch automatically: the
+  page is a plausible size, every file it references resolves, and it even
+  carries a `<style>` block with the right id, just 24KB of it where 115KB
+  belonged. It renders as a mangled layout rather than as naked HTML, which
+  is also why a human skimming the site may not notice.
+
+  The check needs no comparison with other pages: the page declares which id
+  it needs, so a miss is the page contradicting itself. A page may declare
+  several ids — a theme-builder template contributes its own on top of the
+  post's — and an id with no rules of its own is perfectly normal for a
+  template that only arranges other widgets, so the check requires one of the
+  declared ids to be styled, not all of them. If more than half the site
+  trips it, the site simply keeps its Elementor CSS somewhere this check
+  cannot see; that is reported as a note and the check is skipped rather than
+  failing every page.
 
 Anything flagged is retried once, sequentially. Whatever is still broken is
 listed at the end, because a bad page already in the cache will not be fixed
