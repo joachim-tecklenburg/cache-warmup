@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION=2.10.0
+VERSION=2.11.0
 PAR=1
 DELAY=auto         # pause after each page so the backend can finish shutdown work;
                    # 'auto' scales it with how long the page took, 0 disables
@@ -32,6 +32,7 @@ SHORT_RATIO=40      # flag pages under this % of the median page size
 CONSIST=1
 CONSIST_PCT=90      # a css resource on this % of pages is expected on all of them
 USE_ROBOTS=1        # ask robots.txt which sitemaps the site has
+VERIFY=1            # re-fetch a flagged page past the cache before believing it
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 LANG_HEADER="de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
 EXTRA_HEADERS=()
@@ -56,6 +57,7 @@ Options:
   -s          skip the stylesheet/script check
   -C          skip the cross-page consistency check
   -N          do not read robots.txt; warm only the sitemap given
+  -V          do not re-check flagged pages against a cache-bypassing fetch
   -l          list the URLs only, don't request them
   -q          quiet: only the summary
   -h          this help
@@ -84,7 +86,7 @@ and warm them again.
 USAGE
 }
 
-while getopts ":P:d:t:A:a:H:FrsCNlqh" opt; do
+while getopts ":P:d:t:A:a:H:FrsCNVlqh" opt; do
   case "$opt" in
     P) PAR=$OPTARG ;;
     d) DELAY=$OPTARG ;;
@@ -97,6 +99,7 @@ while getopts ":P:d:t:A:a:H:FrsCNlqh" opt; do
     s) CHECK_ASSETS=0 ;;
     C) CONSIST=0 ;;
     N) USE_ROBOTS=0 ;;
+    V) VERIFY=0 ;;
     l) LIST_ONLY=1 ;;
     q) QUIET=1 ;;
     h) usage; exit 0 ;;
@@ -591,9 +594,52 @@ fi
 # page looks like, and it is why a single page can render unstyled while its
 # neighbours are fine.
 
+# A page can differ from its neighbours because its cached copy is damaged, or
+# because the page is simply built differently -- a landing page with a cut-down
+# header, say. Only the first is a fault, and the two are indistinguishable from
+# the cached copy alone. So ask the backend directly: a query string bypasses the
+# page cache, so the answer is what the page is *supposed* to look like right now.
+# Missing there too means the finding was never a fault.
+#
+# The tool's whole job is finding cached copies that differ from what the backend
+# would produce, so this is the direct test and the cross-page comparison is only
+# a way of guessing where to point it.
+verify_page() {  # verify_page <url> <string-that-should-be-there>
+  local u=$1 want=$2 sep="?" fresh
+  case "$u" in *\?*) sep="&" ;; esac
+  fresh=$(curl -sL --compressed -A "$UA" \
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" \
+    "${u}${sep}cb=$$$RANDOM" 2>/dev/null)
+  case "$fresh" in
+    "") return 2 ;;                 # could not ask; leave the finding standing
+    *"$want"*) return 0 ;;          # backend serves it, the cached copy lost it
+    *) return 1 ;;                  # backend does not serve it either
+  esac
+}
+
 # Pages that asked for their own Elementor stylesheet and did not get it.
 PAGECSS_BAD=0
 cat "$TMP"/pagecss.* > "$TMP/pagecss.all" 2>/dev/null
+# Same question as for the consistency findings: does the backend still serve
+# this page its own css? If a fresh render is missing it too, the page has no
+# Elementor css of its own and never did.
+if [ -s "$TMP/pagecss.all" ] && [ "$VERIFY" -eq 1 ]; then
+  : > "$TMP/pagecss.v"
+  while IFS="$(printf '\t')" read -r u pids; do
+    # Keep the finding unless the backend agrees the page has no css of its
+    # own. Only an unambiguous "not there either" (1) clears it; an
+    # unreachable backend (2) must never turn a real fault into silence.
+    keep=1
+    for pid in $(printf '%s' "$pids" | tr ',' ' '); do
+      verify_page "$u" ".elementor-$pid"; v=$?
+      if [ "$v" -eq 0 ]; then keep=1; break; fi
+      if [ "$v" -eq 1 ]; then keep=0; fi
+    done
+    [ "$keep" -eq 1 ] && printf '%s\t%s\n' "$u" "$pids" >> "$TMP/pagecss.v"
+  done < "$TMP/pagecss.all"
+  mv -f "$TMP/pagecss.v" "$TMP/pagecss.all"
+fi
+
 if [ -s "$TMP/pagecss.all" ]; then
   PAGECSS_BAD=$(wc -l < "$TMP/pagecss.all" | tr -d ' ')
   # If most of the site trips this, the site is not broken -- it keeps its
@@ -651,12 +697,51 @@ if [ "$CONSIST" -eq 1 ] && [ "$TOTAL" -ge 8 ]; then
         }
       }' "$TMP/fp.all" | sort > "$TMP/consist"
 
+    # Ask the backend about every hard finding before calling it a fault.
+    if [ "$VERIFY" -eq 1 ] && grep -q '^H' "$TMP/consist"; then
+      [ "$QUIET" -eq 1 ] || printf '\n%schecking flagged pages against a fresh render%s\n' \
+        "$C_DIM" "$C_OFF" >&2
+      : > "$TMP/consist.v"
+      while IFS= read -r line; do
+        case "$line" in
+          H*) u=$(printf '%s' "$line" | cut -f2)
+              want=$(printf '%s' "$line" | cut -f3)
+              verify_page "$u" "$want"; v=$?
+              # 1 means the backend does not serve it either, so the page is
+              # built that way. 0 and 2 both leave the finding standing.
+              if [ "$v" -eq 1 ]; then
+                printf '%s\n' "$line" | sed 's/^H/B/' >> "$TMP/consist.v"
+              else
+                printf '%s\n' "$line" >> "$TMP/consist.v"
+              fi ;;
+          *)  printf '%s\n' "$line" >> "$TMP/consist.v" ;;
+        esac
+      done < "$TMP/consist"
+      mv -f "$TMP/consist.v" "$TMP/consist"
+    fi
+
     CONSIST_BAD=$(awk -F'\t' '$1 == "H"' "$TMP/consist" | wc -l | tr -d ' ')
     CONSIST_SOFT=$(awk -F'\t' '$1 == "S"' "$TMP/consist" | wc -l | tr -d ' ')
+    CONSIST_BYDESIGN=$(awk -F'\t' '$1 == "B"' "$TMP/consist" | wc -l | tr -d ' ')
+
+    if [ "$QUIET" -eq 0 ] && [ "$CONSIST_BYDESIGN" -gt 0 ]; then
+      printf '\n%s%d page(s) differ from the rest of the site on purpose --%s\n' \
+        "$C_DIM" "$CONSIST_BYDESIGN" "$C_OFF" >&2
+      printf '%sa fresh render past the cache is missing the same thing:%s\n' "$C_DIM" "$C_OFF" >&2
+      awk -F'\t' -v dim="$C_DIM" -v off="$C_OFF" '
+        $1 == "B" { printf "  %s%s%s\n", dim, $2, off
+                    for (i = 3; i <= NF; i++) printf "      %swithout %s%s\n", dim, $i, off }' \
+        "$TMP/consist" >&2
+    fi
 
     if [ "$QUIET" -eq 0 ] && [ "$CONSIST_BAD" -gt 0 ]; then
-      printf '\n%s%d page(s) do not load css that %d%% of the site loads:%s\n' \
-        "$C_ERR$C_B" "$CONSIST_BAD" "$CONSIST_PCT" "$C_OFF" >&2
+      if [ "$VERIFY" -eq 1 ]; then
+        printf '\n%s%d page(s) lost css the backend still serves them:%s\n' \
+          "$C_ERR$C_B" "$CONSIST_BAD" "$C_OFF" >&2
+      else
+        printf '\n%s%d page(s) do not load css that %d%% of the site loads:%s\n' \
+          "$C_ERR$C_B" "$CONSIST_BAD" "$CONSIST_PCT" "$C_OFF" >&2
+      fi
       awk -F'\t' -v er="$C_ERR" -v dim="$C_DIM" -v off="$C_OFF" '
         $1 == "H" { printf "  %s%s%s\n", er, $2, off
                     for (i = 3; i <= NF; i++) printf "      %smissing %s%s\n", dim, $i, off }' \

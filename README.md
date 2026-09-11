@@ -99,6 +99,7 @@ perfectly for you while every anonymous request is bounced to a login form.
 | `-s` | skip the stylesheet/script check |
 | `-C` | skip the cross-page consistency check |
 | `-N` | do not read `robots.txt`; warm only the sitemap given |
+| `-V` | do not re-check flagged pages against a cache-bypassing fetch |
 | `-l` | list the URLs only, don't request them |
 | `-q` | quiet: only the summary |
 | `-h` | help |
@@ -164,6 +165,42 @@ each has a check:
   trips it, the site simply keeps its Elementor CSS somewhere this check
   cannot see; that is reported as a note and the check is skipped rather than
   failing every page.
+
+### Every finding is checked against the backend
+
+A page can differ from its neighbours for two reasons: its cached copy is
+damaged, or the page is simply built differently — a landing page with a
+cut-down header, say. Only the first is a fault, and **the cached copy alone
+cannot tell you which it is**.
+
+So before reporting anything, the tool asks the backend directly. A query
+string bypasses the page cache, so a fresh fetch shows what the page is
+supposed to look like right now. If the stylesheet is missing there too, the
+finding was never a fault:
+
+```
+checking flagged pages against a fresh render
+
+1 page(s) differ from the rest of the site on purpose --
+a fresh render past the cache is missing the same thing:
+  https://example.com/workshop/
+      without /wp-content/uploads/elementor/css/custom-pro-widget-mega-menu.min.css
+
+1 page(s) lost css the backend still serves them:
+  https://example.com/agb/
+      missing /wp-content/uploads/elementor/css/custom-widget-icon-list.min.css
+```
+
+Only the second kind fails the run. This matters more than it sounds: on a
+real site the cross-page check flagged two workshop landing pages that were
+perfectly healthy and simply had no mega menu, and failed the build over
+them. Finding cached copies that differ from what the backend would produce
+is the tool's entire job, so this comparison is the direct test — the
+cross-page one is only a way of guessing where to point it.
+
+A backend that cannot be reached leaves the finding standing, because an
+unreachable server must never turn a real fault into silence. `-V` skips
+the check.
 
 Anything flagged is retried once, sequentially. Whatever is still broken is
 listed at the end, because a bad page already in the cache will not be fixed
