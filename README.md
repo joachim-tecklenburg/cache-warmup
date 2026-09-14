@@ -48,6 +48,9 @@ A bare domain is expanded to `https://<domain>/sitemap.xml`, so
 `cache-warmup example.com` is usually all you need. Sitemap indexes are
 followed recursively (up to 3 levels), plain sitemaps work too, `.xml.gz` is
 decompressed, and URLs are deduplicated before anything is requested.
+URLs wrapped in `<![CDATA[…]]>` — as All in One SEO writes them — are read
+correctly, and `&amp;` in a URL is decoded. Image entries (`<image:loc>`) are
+not pages and are ignored.
 
 `robots.txt` is read first and every sitemap it announces is walked as well:
 

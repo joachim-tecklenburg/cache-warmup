@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION=2.11.0
+VERSION=2.12.0
 PAR=1
 DELAY=auto         # pause after each page so the backend can finish shutdown work;
                    # 'auto' scales it with how long the page took, 0 disables
@@ -174,8 +174,21 @@ sitemap_fetch() {
   esac
 }
 
+# The text of every <loc>. Two things valid XML allows and a naive match misses:
+# plugins such as All in One SEO wrap the URL in <![CDATA[...]]>, which starts
+# with the very "<" a [^<]* pattern stops at, so the whole sitemap reads as
+# empty; and outside CDATA an "&" in a URL is escaped as &amp;, which has to be
+# undone or the page requested is one the server has never heard of.
 locs() {
-  tr '\n' ' ' | grep -o '<loc>[^<]*</loc>' | sed 's/<loc>[[:space:]]*\(.*\)[[:space:]]*<\/loc>/\1/'
+  tr '\n\r' '  ' \
+  | grep -o '<loc>[^<]*\(<!\[CDATA\[[^]]*\]\]>\)\{0,1\}[^<]*</loc>' \
+  | awk '{
+      s = $0; sub(/^<loc>/, "", s); sub(/<\/loc>$/, "", s)
+      if (match(s, /<!\[CDATA\[/)) { s = substr(s, RSTART + 9); sub(/\]\]>.*/, "", s) }
+      else gsub(/&amp;/, "\\&", s)
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      if (s != "") print s
+    }'
 }
 
 collect() {  # collect <url> <depth>
@@ -197,6 +210,14 @@ collect() {  # collect <url> <depth>
     # "no <loc> entries" on its own sends people hunting for a sitemap bug when
     # the real answer is usually that they never received a sitemap: the site
     # redirected the request somewhere else, or answered with a page.
+    case "$body" in
+      *"<urlset"*|*"<sitemapindex"*)
+        # It *is* a sitemap; saying otherwise would send someone to check a
+        # file that is fine. Report it as the tool's own failure to read it.
+        echo "cache-warmup: $url is a sitemap, but no <loc> entries could be read from it (HTTP $SM_CODE)" >&2
+        echo "  that is a parsing problem in cache-warmup, not a fault in the site" >&2
+        return ;;
+    esac
     echo "cache-warmup: $url is not a sitemap (HTTP $SM_CODE)" >&2
     [ "$SM_EFF" != "$url" ] && echo "  the site sent us to $SM_EFF instead" >&2
     case "$body" in
