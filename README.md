@@ -68,7 +68,9 @@ Warming that one file leaves every other language cold — and a cold
 language is exactly where a visitor is most likely to be the unlucky one
 who triggers a bad cache write. `Sitemap:` is matched case-insensitively,
 site-relative paths are accepted, and each sitemap is walked once no matter
-how many times it is named. Entries pointing at a **different host** are
+how many times it is named. `example.com` and `www.example.com` count as the same
+host, so the short form finds sitemaps the site announces under `www.`.
+Entries pointing at a **different host** — including any other subdomain — are
 reported and skipped; someone else's `robots.txt` is not a reason to go and
 hammer their server. Use `-N` to warm strictly the sitemap you named.
 

@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION=2.12.0
+VERSION=2.13.0
 PAR=1
 DELAY=auto         # pause after each page so the backend can finish shutdown work;
                    # 'auto' scales it with how long the page took, 0 disables
@@ -124,6 +124,11 @@ esac
 
 ORIGIN=$(printf '%s' "$TARGET" | sed -E 's#^(https?://[^/]+).*#\1#')
 ORIGIN_HOST=${ORIGIN#*://}
+# example.com and www.example.com are the same site; most redirect one to the
+# other and then announce their sitemaps under whichever they chose. Compare
+# hosts with a leading "www." removed, so typing the short form does not make
+# the site's own sitemaps look foreign. Other subdomains stay distinct.
+SITE_HOST=${ORIGIN_HOST#www.}
 
 if [ -t 2 ]; then
   C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_B=$'\033[1m'; C_OFF=$'\033[0m'
@@ -259,7 +264,7 @@ if [ "$USE_ROBOTS" -eq 1 ]; then
       *)  sm="$ORIGIN/$sm" ;;
     esac
     smhost=${sm#*://}; smhost=${smhost%%/*}
-    if [ "$smhost" != "$ORIGIN_HOST" ]; then
+    if [ "${smhost#www.}" != "$SITE_HOST" ]; then
       [ "$QUIET" -eq 1 ] || \
         echo "${C_DIM}robots.txt: skipping $sm (different host)${C_OFF}" >&2
       continue
