@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION=2.13.0
+VERSION=2.14.0
 PAR=1
 DELAY=auto         # pause after each page so the backend can finish shutdown work;
                    # 'auto' scales it with how long the page took, 0 disables
@@ -33,6 +33,8 @@ CONSIST=1
 CONSIST_PCT=90      # a css resource on this % of pages is expected on all of them
 USE_ROBOTS=1        # ask robots.txt which sitemaps the site has
 VERIFY=1            # re-fetch a flagged page past the cache before believing it
+CHECK_CACHE=1       # before warming, find out whether anything stores the pages
+PROBE_PAGES=3       # how many pages that check requests twice
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 LANG_HEADER="de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
 EXTRA_HEADERS=()
@@ -58,6 +60,7 @@ Options:
   -C          skip the cross-page consistency check
   -N          do not read robots.txt; warm only the sitemap given
   -V          do not re-check flagged pages against a cache-bypassing fetch
+  -k          skip the check for an active page cache before warming
   -l          list the URLs only, don't request them
   -q          quiet: only the summary
   -h          this help
@@ -86,7 +89,7 @@ and warm them again.
 USAGE
 }
 
-while getopts ":P:d:t:A:a:H:FrsCNVlqh" opt; do
+while getopts ":P:d:t:A:a:H:FrsCNVklqh" opt; do
   case "$opt" in
     P) PAR=$OPTARG ;;
     d) DELAY=$OPTARG ;;
@@ -100,6 +103,7 @@ while getopts ":P:d:t:A:a:H:FrsCNVlqh" opt; do
     C) CONSIST=0 ;;
     N) USE_ROBOTS=0 ;;
     V) VERIFY=0 ;;
+    k) CHECK_CACHE=0 ;;
     l) LIST_ONLY=1 ;;
     q) QUIET=1 ;;
     h) usage; exit 0 ;;
@@ -137,7 +141,41 @@ else
 fi
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/cache-warmup.XXXXXX") || exit 1
-trap 'rm -rf "$TMP"' EXIT INT TERM
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+
+# Ctrl+C. The old trap deleted the temp directory and then let the script carry
+# on through the retry, asset, consistency and summary passes, each of them
+# reading files that no longer existed: a screenful of errors, and exit status
+# 0 for a run that never finished. Now an interrupt stops every process this
+# run started, says how far it got, and exits 130 like any interrupted command.
+PHASE=walk
+kill_tree() {  # TERM every descendant of this script, from one process snapshot
+  local pids
+  pids=$(ps -axo pid=,ppid= | awk -v root="$$" '
+    { parent[$1] = $2 }
+    END { for (p in parent) {
+            q = p
+            while ((q in parent) && q != root && q > 1) q = parent[q]
+            if (q == root && p != root) print p } }')
+  [ -n "$pids" ] && kill -TERM $pids 2>/dev/null
+}
+on_interrupt() {
+  trap '' INT TERM
+  kill_tree
+  sleep 0.2   # let the killed workers exit before their files are removed
+  local n=0 msg
+  case "$PHASE" in
+    walk)  msg="while reading sitemaps -- nothing was warmed." ;;
+    probe) msg="during the cache check -- at most $PROBE_PAGES page(s) were requested." ;;
+    warm)  [ -f "$TMP/results" ] && n=$(wc -l < "$TMP/results" | tr -d ' ')
+           msg="after $n of $TOTAL pages -- those are warmed, the rest are not, and nothing was checked." ;;
+    *)     msg="after all $TOTAL pages were requested, before the checks finished -- no verdict on them." ;;
+  esac
+  printf '\n%sinterrupted%s %s\n' "$C_WARN" "$C_OFF" "$msg" >&2
+  exit 130
+}
+trap on_interrupt INT TERM
 
 # ---------------------------------------------------------------- sitemap walk
 
@@ -299,6 +337,7 @@ TOTAL=$(wc -l < "$TMP/urls.uniq" | tr -d ' ')
 
 cat > "$TMP/worker.sh" <<'WORKER'
 #!/usr/bin/env bash
+trap 'exit 1' INT TERM   # die quietly; the main script reports the interrupt
 url=$1
 body="$TMP/body.$$"
 hdr="$TMP/hdr.$$"
@@ -481,7 +520,93 @@ done
 export TMP UA LANG_HEADER FOLLOW TIMEOUT CONNECT_TIMEOUT CHECK_ASSETS \
        DELAY DELAY_FACTOR DELAY_FLOOR DELAY_CAP
 
+# ---------------------------------------------------------------- cache probe
+# Warming only helps if something stores the pages. Request the first few pages
+# twice in a row and look for evidence that the second answer came from a cache:
+# a plugin's footer comment (WP Fastest Cache and friends send no telling
+# headers at all -- "age: 0" and "no-cache" on a fully cached page), a proxy or
+# CDN header reporting a hit, or a repeat request that is dramatically faster.
+
+PHASE=probe
+CACHE_VERDICT=""
+CACHE_NONE=0
+if [ "$CHECK_CACHE" -eq 1 ]; then
+  pfollow=""; [ "$FOLLOW" -eq 1 ] && pfollow="-L"
+  phdr=()
+  if [ -s "$TMP/headers" ]; then
+    while IFS= read -r h; do [ -n "$h" ] && phdr+=(-H "$h"); done < "$TMP/headers"
+  fi
+
+  probe_fetch() {  # probe_fetch <url> <tag>: headers/body into $TMP/<tag>.h/.b, prints seconds
+    curl -s $pfollow --compressed -A "$UA" \
+      -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+      -H "Accept-Language: $LANG_HEADER" \
+      ${phdr[@]+"${phdr[@]}"} \
+      --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" \
+      -D "$TMP/$2.h" -o "$TMP/$2.b" -w '%{time_total}' "$1" 2>/dev/null
+  }
+
+  cache_signature() {  # cache_signature <tag>: name of the cache, or nothing
+    local name
+    name=$(tail -c 4096 "$TMP/$1.b" 2>/dev/null | awk '
+      /WP Fastest Cache/               { print "WP Fastest Cache"; exit }
+      /W3 Total Cache/                 { print "W3 Total Cache";   exit }
+      /WP-Super-Cache|WP Super Cache/  { print "WP Super Cache";   exit }
+      /WP Rocket|like a Rocket/        { print "WP Rocket";        exit }
+      /LiteSpeed Cache/                { print "LiteSpeed Cache";  exit }
+      /WP-Optimize/                    { print "WP-Optimize";      exit }
+      /Cache Enabler/                  { print "Cache Enabler";    exit }')
+    [ -z "$name" ] && name=$(tr -d '\r' < "$TMP/$1.h" 2>/dev/null | awk '
+      { i = index($0, ":"); if (!i) next
+        k = tolower(substr($0, 1, i - 1)); v = substr($0, i + 1); sub(/^[ \t]+/, "", v); lv = tolower(v) }
+      k != "cache-control" && k ~ /cache/ && lv ~ /hit/ { print substr($0, 1, i - 1) ": " v; exit }
+      k == "x-varnish" && lv ~ /^[0-9]+ [0-9]+$/        { print "Varnish"; exit }
+      k == "age" && v + 0 > 0                           { print "age: " v; exit }')
+    printf '%s' "$name"
+  }
+
+  [ "$QUIET" -eq 1 ] || printf '%schecking whether a page cache is active%s\n' "$C_DIM" "$C_OFF" >&2
+  np=0; nsig=0; nfaster=0; nfast=0; sig=""; sum1=0; sum2=0
+  head -"$PROBE_PAGES" "$TMP/urls.uniq" > "$TMP/probe.urls"
+  while IFS= read -r u; do
+    t1=$(probe_fetch "$u" probe1); t1=${t1:-0}
+    sleep 0.5   # give the cache a moment to finish writing what it just built
+    t2=$(probe_fetch "$u" probe2); t2=${t2:-0}
+    np=$((np + 1))
+    s=$(cache_signature probe2); [ -z "$s" ] && s=$(cache_signature probe1)
+    [ -n "$s" ] && { nsig=$((nsig + 1)); sig=$s; }
+    kind=$(awk -v a="$t1" -v b="$t2" 'BEGIN {
+      if (a > 0.5 && b < a / 2) print "faster"; else if (a <= 0.5 && b <= 0.5) print "fast"; else print "slow" }')
+    case "$kind" in faster) nfaster=$((nfaster + 1)) ;; fast) nfast=$((nfast + 1)) ;; esac
+    sums=$(awk -v s1="$sum1" -v s2="$sum2" -v a="$t1" -v b="$t2" 'BEGIN { print s1 + a, s2 + b }')
+    sum1=${sums% *}; sum2=${sums#* }
+    [ "$QUIET" -eq 1 ] || printf '  %s%5.2fs, again %5.2fs%s  %s%s\n' \
+      "$C_DIM" "$t1" "$t2" "$C_OFF" "$u" "${s:+  ${C_OK}$s${C_OFF}}" >&2
+  done < "$TMP/probe.urls"
+  rm -f "$TMP"/probe1.* "$TMP"/probe2.*
+
+  avg=$(awk -v s1="$sum1" -v s2="$sum2" -v n="$np" 'BEGIN { if (n) printf "%.2fs, then %.2fs", s1 / n, s2 / n }')
+  if [ "$nsig" -gt 0 ]; then
+    CACHE_VERDICT="active ($sig)"
+    [ "$QUIET" -eq 1 ] || printf '%spage cache active:%s %s\n\n' "$C_OK" "$C_OFF" "$sig" >&2
+  elif [ $((nfaster * 2)) -gt "$np" ]; then
+    CACHE_VERDICT="probably active (repeat requests much faster, cache not identified)"
+    [ "$QUIET" -eq 1 ] || printf '%spage cache probably active:%s repeat requests are much faster (%s),\nthough nothing identifies which cache it is\n\n' \
+      "$C_OK" "$C_OFF" "$avg" >&2
+  elif [ "$nfast" -eq "$np" ]; then
+    CACHE_VERDICT="unclear (pages answer fast either way, no cache identified)"
+    [ "$QUIET" -eq 1 ] || printf '%spage cache unclear:%s pages answer in under 0.5s whether or not they were just\nrequested, and nothing identifies a cache -- either one this tool does not\nrecognise, or a site fast enough not to need one\n\n' \
+      "$C_WARN" "$C_OFF" >&2
+  else
+    CACHE_NONE=1
+    CACHE_VERDICT="none detected (repeat requests no faster: $avg)"
+    printf '%sno page cache detected:%s requesting the same page twice was no faster\n(%s) and nothing identifies a cache. Warming only helps if\nsomething stores the pages -- this run will load the server and leave nothing\nfaster behind. Carrying on anyway; -k skips this check.\n\n' \
+      "$C_WARN$C_B" "$C_OFF" "$avg" >&2
+  fi
+fi
+
 # ------------------------------------------------------------------- warm them
+PHASE=warm
 
 render() {  # reads result lines on stdin, prints progress, appends to results
   local n=0 code time bytes flag url c mark
@@ -523,6 +648,7 @@ if [ "$TOTAL" -gt 1 ]; then
 fi
 
 # ------------------------------------------------------------------- retry pass
+PHASE=check
 
 median_of() {  # median byte size of the intact html pages in $1
   awk -F'\t' '$4 == "ok" { print $3 }' "$1" | sort -n | \
@@ -794,7 +920,8 @@ MEDIAN=$(median_of "$TMP/results"); MEDIAN=${MEDIAN:-0}
 awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WARN" \
     -v er="$C_ERR" -v dim="$C_DIM" -v b="$C_B" -v off="$C_OFF" \
     -v nassets="${NASSET:-0}" -v abad="$ASSET_BAD" -v cbad="$CONSIST_BAD" \
-    -v aflaky="$ASSET_FLAKY" -v pcbad="$PAGECSS_BAD" '
+    -v aflaky="$ASSET_FLAKY" -v pcbad="$PAGECSS_BAD" \
+    -v cache="$CACHE_VERDICT" -v cachenone="$CACHE_NONE" '
   { n++; sum += $2
     if ($2 > slow) { slow = $2; slowurl = $5 }
     cls = ($1 == "000") ? "no response" : substr($1, 1, 1) "xx"
@@ -810,6 +937,7 @@ awk -F'\t' -v med="$MEDIAN" -v ratio="$SHORT_RATIO" -v ok="$C_OK" -v warn="$C_WA
       printf "  %s%-12s %d%s\n", col, c, count[c], off
     }
     if (med > 0) printf "%s  median page %.0fK%s\n", dim, med / 1024, off
+    if (cache != "") printf "%s  page cache %s%s\n", (cachenone ? warn : dim), cache, off
     if (nassets > 0) {
       col = (abad > 0) ? er : dim
       printf "%s  %d stylesheet/script urls, %d missing%s\n", col, nassets, abad, off

@@ -105,12 +105,49 @@ perfectly for you while every anonymous request is bounced to a login form.
 | `-C` | skip the cross-page consistency check |
 | `-N` | do not read `robots.txt`; warm only the sitemap given |
 | `-V` | do not re-check flagged pages against a cache-bypassing fetch |
+| `-k` | skip the check for an active page cache before warming |
 | `-l` | list the URLs only, don't request them |
 | `-q` | quiet: only the summary |
 | `-h` | help |
 
 Exit status is `1` if any page or asset came back broken, so it drops into a
 deploy hook or cron job unchanged.
+
+## Is there a cache at all?
+
+Warming only helps if something stores the pages. Before the run, the first
+three pages are each requested twice, and the tool looks for evidence that the
+second answer came from a cache:
+
+```
+checking whether a page cache is active
+   1.41s, again  0.15s  https://example.com/  WP Fastest Cache
+   ...
+page cache active: WP Fastest Cache
+```
+
+Headers alone are not enough: WP Fastest Cache serves fully cached pages with
+`age: 0` and `cache-control: no-cache`, so the tool also reads the footer
+comment that WP Fastest Cache, W3 Total Cache, WP Super Cache, WP Rocket,
+LiteSpeed Cache, WP-Optimize and Cache Enabler leave in the page. Failing that,
+any proxy or CDN header reporting a hit counts (`x-cache`, `cf-cache-status`,
+`x-litespeed-cache`, a non-zero `age`, Varnish), and so does a repeat request
+that takes less than half as long as the first.
+
+If nothing points to a cache, the tool says so plainly and carries on — the
+run would load the server without leaving anything faster behind. If pages
+answer in under half a second either way and no cache is identified, the
+verdict is "unclear" rather than a guess. The verdict is repeated in the
+summary. `-k` skips the check.
+
+## Stopping a run
+
+Ctrl+C stops every request the run started, says how far it got, and exits
+with status 130:
+
+```
+interrupted after 87 of 254 pages -- those are warmed, the rest are not, and nothing was checked.
+```
 
 ## What it checks
 
