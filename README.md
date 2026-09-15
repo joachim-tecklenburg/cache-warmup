@@ -16,8 +16,10 @@ cache-warmup https://example.com/sitemap.xml
 sitemap index: https://example.com/sitemap.xml
 sitemap: https://example.com/wp-sitemap-posts-page-1.xml (20 urls)
 warming 53 urls as a browser, one at a time
-[ 1/53] 200   0.14s    320K  https://example.com/
-[ 2/53] 200   0.19s    275K  https://example.com/about/
+[ 1/53] 200   0.14s    320K           https://example.com/
+[ 2/53] 200   0.19s    275K           https://example.com/about/
+...
+[ 9/53] 200   1.12s    301K  ~1m04s   https://example.com/contact/
 ...
 checking 87 stylesheet/script url(s) referenced by those pages
 
@@ -26,6 +28,12 @@ checking 87 stylesheet/script url(s) referenced by those pages
   median page 282K
   87 stylesheet/script urls, 0 missing
 ```
+
+The column before each URL is the estimated time left for warming. It comes
+from the wall-clock time per finished page, not from response times, so it
+already accounts for the pauses between pages and for `-P`. It appears once a
+few pages are done (5, or twice `-P`), and covers warming only — the checks
+afterwards are not included.
 
 ## Install
 

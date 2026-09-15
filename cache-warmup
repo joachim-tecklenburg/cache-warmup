@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION=2.14.0
+VERSION=2.15.0
 PAR=1
 DELAY=auto         # pause after each page so the backend can finish shutdown work;
                    # 'auto' scales it with how long the page took, 0 disables
@@ -608,8 +608,16 @@ fi
 # ------------------------------------------------------------------- warm them
 PHASE=warm
 
+fmt_eta() {  # fmt_eta <seconds>: 45s, 4m12s, 1h04m
+  local t=$1
+  if [ "$t" -lt 60 ]; then printf '%ss' "$t"
+  elif [ "$t" -lt 3600 ]; then printf '%dm%02ds' $((t / 60)) $((t % 60))
+  else printf '%dh%02dm' $((t / 3600)) $((t % 3600 / 60))
+  fi
+}
+
 render() {  # reads result lines on stdin, prints progress, appends to results
-  local n=0 code time bytes flag url c mark
+  local n=0 code time bytes flag url c mark done_n left now eta secs
   while IFS=$'\t' read -r code time bytes flag url; do
     printf '%s\t%s\t%s\t%s\t%s\n' "$code" "$time" "$bytes" "$flag" "$url" >> "$TMP/results"
     [ "$QUIET" -eq 1 ] && continue
@@ -621,14 +629,30 @@ render() {  # reads result lines on stdin, prints progress, appends to results
       *)          c=$C_ERR; mark="" ;;
     esac
     [ "$code" = 000 ] && code="---"
-    printf '%s[%*d/%d]%s %s%s%s %6.2fs %6sK  %s%s\n' \
-      "$C_DIM" "${#TOTAL}" "$((n + DONE))" "$TOTAL" "$C_OFF" \
-      "$c" "$code" "$C_OFF" "$time" "$((bytes / 1024))" "$url" "$mark" >&2
+    # Time remaining, from wall-clock time per finished page rather than from
+    # response times: that already includes the pauses between pages and the
+    # effect of -P, which response times alone would get badly wrong.
+    # The clock has one-second resolution, so hold the estimate back until
+    # enough pages have finished for that rounding not to swamp it -- at -P 4
+    # the first batch lands together and would otherwise promise 19s for 5s.
+    done_n=$((n + DONE)); left=$((TOTAL - done_n)); eta=""
+    if [ "$left" -gt 0 ] && [ "$done_n" -ge "$ETA_AFTER" ]; then
+      now=$(date +%s)
+      secs=$(( (now - WARM_START) * left / done_n ))
+      [ "$secs" -lt 1 ] && secs=1
+      eta="~$(fmt_eta "$secs")"
+    fi
+    printf '%s[%*d/%d]%s %s%s%s %6.2fs %6sK  %s%-7s%s  %s%s\n' \
+      "$C_DIM" "${#TOTAL}" "$done_n" "$TOTAL" "$C_OFF" \
+      "$c" "$code" "$C_OFF" "$time" "$((bytes / 1024))" \
+      "$C_DIM" "$eta" "$C_OFF" "$url" "$mark" >&2
   done
 }
 
 : > "$TMP/results"
 DONE=0
+WARM_START=$(date +%s)
+ETA_AFTER=$((PAR * 2)); [ "$ETA_AFTER" -lt 5 ] && ETA_AFTER=5
 if [ "$QUIET" -eq 0 ]; then
   if [ "$PAR" -le 1 ]; then
     echo "warming $TOTAL urls as a browser, one at a time" >&2
